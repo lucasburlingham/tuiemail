@@ -5,9 +5,10 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
 ## Features
 
 - Folder view: `Inbox`, `Sent`, `Drafts`, `Archive`, `Flagged`, `Trash`
+- Conversation view inside each folder (threads grouped by subject)
 - Message operations:
-  - `d`: Delete (moves to Trash)
-  - `r`: Toggle Read/Unread
+  - `d`: Move selected conversation to Trash
+  - `r`: Toggle Read/Unread for selected conversation
   - `s`: Send selected draft (from Drafts)
   - `u`: Refresh from server (Update)
   - `n`: Compose new message
