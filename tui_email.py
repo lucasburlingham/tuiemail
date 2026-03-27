@@ -735,6 +735,10 @@ class TUIEmail:
         self.config = load_config()
         if not (self.config.get("imap_host") and self.config.get("imap_user") and self.config.get("imap_pass")):
             self.config = setup_configuration(self.stdscr)
+        try:
+            self.fetch_limit = max(1, int(self.config.get("fetch_limit", FETCH_LIMIT)))
+        except Exception:
+            self.fetch_limit = FETCH_LIMIT
 
         self.last_fetch = {}
         self.messages = load_messages(self.current_folder())
@@ -899,6 +903,34 @@ class TUIEmail:
             "body": f"\n\nOn {msg.date}, {msg.from_addr} wrote:\n{self._quote_body(msg.body)}",
         }
 
+    def _build_reply_all_seed(self, msg):
+        my_addr = (self.config.get("imap_user", "") or "").strip().lower()
+        seen = set()
+        to_addrs = []
+        cc_addrs = []
+
+        def add_unique(target, addr):
+            clean = (addr or "").strip().lower()
+            if not clean or clean == my_addr or clean in seen:
+                return
+            seen.add(clean)
+            target.append(clean)
+
+        add_unique(to_addrs, msg.from_addr)
+
+        original_recipients = getaddresses([msg.to_addr or "", msg.cc_addr or ""])
+        for _, addr in original_recipients:
+            add_unique(cc_addrs, addr)
+
+        return {
+            "title": "Reply All",
+            "to": ", ".join(to_addrs),
+            "cc": ", ".join(cc_addrs),
+            "bcc": "",
+            "subject": self._prefixed_subject(msg.subject, "Re"),
+            "body": f"\n\nOn {msg.date}, {msg.from_addr} wrote:\n{self._quote_body(msg.body)}",
+        }
+
     def _build_forward_seed(self, msg):
         forwarded = (
             "\n\n---------- Forwarded message ----------\n"
@@ -916,6 +948,230 @@ class TUIEmail:
             "subject": self._prefixed_subject(msg.subject, "Fwd"),
             "body": forwarded,
         }
+
+    def _confirm_reset_modal(self):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(10, h - 2)
+        modal_w = min(80, w - 4)
+        if modal_h < 8 or modal_w < 50:
+            return False
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        while True:
+            win.erase()
+            self._draw_ascii_modal_border(win)
+            win.addstr(0, 2, " Confirm Reset ", curses.A_BOLD)
+            win.addstr(2, 2, "Delete local messages DB and config?")
+            win.addstr(3, 2, "This cannot be undone.")
+            win.addstr(modal_h - 2, 2, "Press y to confirm, n to cancel")
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("y"), ord("Y")):
+                return True
+            if key in (ord("n"), ord("N"), 27, ord("q"), ord("Q")):
+                return False
+
+    def _reset_local_data_and_reconfigure(self):
+        try:
+            if DB_PATH.exists():
+                DB_PATH.unlink()
+            if CONFIG_PATH.exists():
+                CONFIG_PATH.unlink()
+            init_db()
+            self.folders = sort_folders(list(FOLDERS_DEFAULT))
+            save_folders(self.folders)
+            self.folder_index = 0
+            self.message_index = 0
+            self.detail_scroll = 0
+            self.last_fetch = {}
+            self.config = setup_configuration(self.stdscr)
+            try:
+                self.fetch_limit = max(1, int(self.config.get("fetch_limit", FETCH_LIMIT)))
+            except Exception:
+                self.fetch_limit = FETCH_LIMIT
+            self.messages = load_messages(self.current_folder())
+            self.conversations = build_conversations(self.messages)
+            self.status = "Local DB/config reset and reconfigured"
+        except Exception as exc:
+            self.status = f"Reset failed: {exc}"
+
+    def settings_modal(self):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(26, h - 2)
+        modal_w = min(96, w - 4)
+        if modal_h < 14 or modal_w < 60:
+            self.status = "Terminal too small for settings modal"
+            return
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        fields = [
+            {"key": "imap_host", "label": "IMAP Host", "type": "text", "secret": False},
+            {"key": "imap_port", "label": "IMAP Port", "type": "int", "secret": False},
+            {"key": "imap_ssl", "label": "IMAP SSL", "type": "bool", "secret": False},
+            {"key": "imap_user", "label": "IMAP User", "type": "text", "secret": False},
+            {"key": "imap_pass", "label": "IMAP Pass", "type": "text", "secret": True},
+            {"key": "smtp_host", "label": "SMTP Host", "type": "text", "secret": False},
+            {"key": "smtp_port", "label": "SMTP Port", "type": "int", "secret": False},
+            {"key": "smtp_ssl", "label": "SMTP SSL", "type": "bool", "secret": False},
+            {"key": "smtp_starttls", "label": "SMTP STARTTLS", "type": "bool", "secret": False},
+            {"key": "smtp_user", "label": "SMTP User", "type": "text", "secret": False},
+            {"key": "smtp_pass", "label": "SMTP Pass", "type": "text", "secret": True},
+            {"key": "fetch_limit", "label": "Fetch Limit", "type": "int", "secret": False},
+            {"key": "__reset__", "label": "Reset DB + Config", "type": "action", "secret": False},
+        ]
+
+        values = {}
+        for field in fields:
+            key = field["key"]
+            if key == "__reset__":
+                continue
+            default = ""
+            if key == "imap_port":
+                default = "993"
+            elif key == "smtp_port":
+                default = "587"
+            elif key == "fetch_limit":
+                default = str(FETCH_LIMIT)
+
+            if field["type"] == "bool":
+                values[key] = bool(self.config.get(key, key in ("imap_ssl", "smtp_starttls")))
+            else:
+                values[key] = str(self.config.get(key, default) if self.config.get(key, default) is not None else "")
+
+        active = 0
+        cursor = len(values.get(fields[active]["key"], "")) if fields[active]["type"] in ("text", "int") else 0
+        scroll = 0
+        top = 2
+        bottom_reserved = 3
+        visible_rows = modal_h - top - bottom_reserved
+
+        while True:
+            max_scroll = max(0, len(fields) - visible_rows)
+            scroll = max(0, min(scroll, max_scroll))
+            if active < scroll:
+                scroll = active
+            if active >= scroll + visible_rows:
+                scroll = active - visible_rows + 1
+
+            win.erase()
+            self._draw_ascii_modal_border(win)
+            win.addstr(0, 2, " Settings ", curses.A_BOLD)
+
+            for i in range(visible_rows):
+                idx = scroll + i
+                if idx >= len(fields):
+                    break
+                field = fields[idx]
+                y = top + i
+                key = field["key"]
+                attr = curses.A_REVERSE if idx == active else curses.A_NORMAL
+                label = f"{field['label']}:"
+                win.addstr(y, 2, label[:24].ljust(24), attr)
+
+                if field["type"] == "action":
+                    action_text = "[ Enter ] Delete DB + Config"
+                    win.addstr(y, 27, action_text[: modal_w - 30].ljust(modal_w - 30), attr)
+                elif field["type"] == "bool":
+                    bool_text = "yes" if values[key] else "no"
+                    win.addstr(y, 27, bool_text.ljust(modal_w - 30), attr)
+                else:
+                    raw = values[key]
+                    display = ("*" * len(raw)) if field.get("secret") and raw else raw
+                    win.addstr(y, 27, display[: modal_w - 30].ljust(modal_w - 30), attr)
+
+            win.addstr(modal_h - 2, 2, "Tab/Shift+Tab or Up/Down: navigate  F2:save  F5:reset  Esc/q:close")
+
+            active_field = fields[active]
+            if active_field["type"] in ("text", "int"):
+                key = active_field["key"]
+                row = active - scroll
+                if 0 <= row < visible_rows:
+                    y = top + row
+                    x = 27 + min(cursor, max(0, modal_w - 31))
+                    win.move(y, x)
+
+            win.refresh()
+            key = win.getch()
+
+            if key in (27, ord("q"), ord("Q"), curses.KEY_F10):
+                self.status = "Settings cancelled"
+                return
+
+            if key == curses.KEY_F5:
+                if self._confirm_reset_modal():
+                    self._reset_local_data_and_reconfigure()
+                    return
+                continue
+
+            if key == curses.KEY_F2:
+                try:
+                    for field in fields:
+                        if field["key"] == "__reset__":
+                            continue
+                        fkey = field["key"]
+                        if field["type"] == "bool":
+                            self.config[fkey] = bool(values[fkey])
+                        elif field["type"] == "int":
+                            v = int((values[fkey] or "").strip())
+                            if fkey in ("imap_port", "smtp_port") and not (1 <= v <= 65535):
+                                raise ValueError(f"{fkey} must be 1-65535")
+                            if fkey == "fetch_limit" and v <= 0:
+                                raise ValueError("fetch_limit must be > 0")
+                            self.config[fkey] = v
+                        else:
+                            self.config[fkey] = values[fkey]
+
+                    save_config(self.config)
+                    try:
+                        self.fetch_limit = max(1, int(self.config.get("fetch_limit", FETCH_LIMIT)))
+                    except Exception:
+                        self.fetch_limit = FETCH_LIMIT
+                    self.status = "Settings saved"
+                    return
+                except Exception as exc:
+                    self.status = f"Settings error: {exc}"
+                    continue
+
+            if key in (9, curses.KEY_DOWN):
+                active = (active + 1) % len(fields)
+                active_field = fields[active]
+                cursor = len(values.get(active_field["key"], "")) if active_field["type"] in ("text", "int") else 0
+                continue
+            if key in (curses.KEY_BTAB, curses.KEY_UP):
+                active = (active - 1) % len(fields)
+                active_field = fields[active]
+                cursor = len(values.get(active_field["key"], "")) if active_field["type"] in ("text", "int") else 0
+                continue
+
+            active_field = fields[active]
+            if active_field["type"] == "action":
+                if key in (10, 13, curses.KEY_ENTER):
+                    if self._confirm_reset_modal():
+                        self._reset_local_data_and_reconfigure()
+                        return
+                continue
+            if active_field["type"] == "bool":
+                if key in (10, 13, curses.KEY_ENTER, ord(" "), curses.KEY_LEFT, curses.KEY_RIGHT):
+                    values[active_field["key"]] = not values[active_field["key"]]
+                continue
+            if active_field["type"] in ("text", "int"):
+                val_key = active_field["key"]
+                current_text = values[val_key]
+                updated_text, updated_cursor = self._handle_single_line_key(key, current_text, cursor)
+                if active_field["type"] == "int":
+                    if updated_text and not updated_text.isdigit():
+                        continue
+                values[val_key] = updated_text
+                cursor = updated_cursor
 
     def confirm_send_modal(self, draft_msg):
         h, w = self.stdscr.getmaxyx()
@@ -1108,7 +1364,7 @@ class TUIEmail:
     def fetch_current_folder(self):
         folder = self.current_folder()
         self.status = f"Fetching {folder}..."
-        msgs = fetch_imap_messages(self.config, folder, fetch_limit=FETCH_LIMIT)
+        msgs = fetch_imap_messages(self.config, folder, fetch_limit=self.fetch_limit)
         if msgs is None:
             self.status = f"Fetch failed for '{folder}'"
             return
@@ -1146,6 +1402,88 @@ class TUIEmail:
             f"({len(self.folders)-failed}/{len(self.folders)} folders)"
         )
 
+    def delete_selected_conversation_verified(self):
+        if not self.conversations:
+            self.status = "No conversation selected"
+            return
+
+        selected_convo = self.conversations[self.message_index]
+        source_folder = self.current_folder()
+        target_msgs = list(selected_convo.messages)
+
+        attempted = 0
+        cmd_ok = 0
+        unverifiable = 0
+
+        keys_by_msg_id = {}
+        cmd_ok_by_msg_id = {}
+        for msg in target_msgs:
+            key = message_sync_key(msg)
+            keys_by_msg_id[msg.id] = key
+            if key is None:
+                cmd_ok_by_msg_id[msg.id] = False
+                unverifiable += 1
+                continue
+            attempted += 1
+            ok = remote_delete_message(self.config, msg.folder, msg.remote_uid)
+            cmd_ok_by_msg_id[msg.id] = ok
+            if ok:
+                cmd_ok += 1
+
+        # Auto-refresh source folder to verify actual server state.
+        remote_after = fetch_imap_messages(self.config, source_folder, fetch_limit=0)
+        if remote_after is None:
+            # Fall back to command-level result when verification fetch fails.
+            for msg in target_msgs:
+                key = keys_by_msg_id.get(msg.id)
+                if key is None:
+                    msg.folder = "Trash"
+                    save_message(msg)
+                    continue
+                if cmd_ok_by_msg_id.get(msg.id, False):
+                    msg.folder = "Trash"
+                else:
+                    msg.folder = source_folder
+                save_message(msg)
+            self.messages = load_messages(self.current_folder())
+            self.conversations = build_conversations(self.messages)
+            self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+            self.detail_scroll = 0
+            self.status = (
+                f"Delete pending verify: cmd-ok {cmd_ok}/{attempted}, "
+                f"unverifiable {unverifiable} (refresh failed)"
+            )
+            return
+
+        remote_keys = {message_sync_key(m) for m in remote_after if message_sync_key(m) is not None}
+
+        verified_deleted = 0
+        still_on_server = 0
+        for msg in target_msgs:
+            key = keys_by_msg_id.get(msg.id)
+            if key is None:
+                msg.folder = "Trash"
+                save_message(msg)
+                continue
+
+            if key in remote_keys:
+                still_on_server += 1
+                msg.folder = source_folder
+            else:
+                verified_deleted += 1
+                msg.folder = "Trash"
+            save_message(msg)
+
+        self.messages = load_messages(self.current_folder())
+        self.conversations = build_conversations(self.messages)
+        self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+        self.detail_scroll = 0
+        total = len(target_msgs)
+        self.status = (
+            f"Delete verified {verified_deleted}/{attempted} server, "
+            f"still {still_on_server}, local-only {unverifiable}, total {total}"
+        )
+
     def _wrap_shortcuts(self, items, max_width):
         if max_width <= 0:
             return [""]
@@ -1166,18 +1504,41 @@ class TUIEmail:
         lines = (body or "").splitlines()
         wrapped_body_lines = []
         wrap_width = max(1, width)
+        url_pattern = re.compile(r"https?://\S+")
+
+        def _tokenize_preserving_urls(text):
+            tokens = []
+            pos = 0
+            for m in url_pattern.finditer(text):
+                if m.start() > pos:
+                    tokens.extend(re.findall(r"\S+", text[pos : m.start()]))
+                tokens.append(m.group(0))
+                pos = m.end()
+            if pos < len(text):
+                tokens.extend(re.findall(r"\S+", text[pos:]))
+            return tokens
+
+        def _wrap_tokens(tokens):
+            if not tokens:
+                return [""]
+            out = []
+            current = ""
+            for token in tokens:
+                candidate = token if not current else f"{current} {token}"
+                if len(candidate) <= wrap_width or not current:
+                    current = candidate
+                else:
+                    out.append(current)
+                    current = token
+            if current:
+                out.append(current)
+            return out
+
         for raw_line in lines:
             if raw_line == "":
                 wrapped_body_lines.append("")
                 continue
-            wrapped = textwrap.wrap(
-                raw_line,
-                width=wrap_width,
-                replace_whitespace=False,
-                drop_whitespace=False,
-                break_long_words=True,
-                break_on_hyphens=False,
-            )
+            wrapped = _wrap_tokens(_tokenize_preserving_urls(raw_line))
             wrapped_body_lines.extend(wrapped or [""])
         return wrapped_body_lines or [""]
 
@@ -1226,12 +1587,45 @@ class TUIEmail:
             for idx, line in enumerate(wrapped_body[scroll : scroll + body_h]):
                 win.addstr(body_top + idx, 2, line[:body_width].ljust(body_width))
 
-            hint = "Up/Down/PgUp/PgDn/mouse wheel scroll  Space/Esc/q close"
+            hint = "r:reply  a:reply-all  f:forward  Up/Down/PgUp/PgDn/wheel scroll  Space/Esc/q close"
             win.addstr(modal_h - 1, 2, hint[: modal_w - 4])
             win.refresh()
 
             key = win.getch()
             if key in (ord("q"), ord("Q"), 27, ord(" ")):
+                return
+            if key in (ord("r"), ord("R")):
+                seed = self._build_reply_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+                return
+            if key in (ord("a"), ord("A")):
+                seed = self._build_reply_all_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+                return
+            if key in (ord("f"), ord("F")):
+                seed = self._build_forward_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
                 return
             if key in (curses.KEY_UP, ord("k")):
                 scroll = max(0, scroll - 1)
@@ -1274,6 +1668,7 @@ class TUIEmail:
 
         shortcut_items = [
             "q:Quit",
+            "o:Settings",
             "Space:View",
             "c:Compose",
             "R:Reply",
@@ -1424,23 +1819,14 @@ class TUIEmail:
             elif key == ord(" ") and self.conversations:
                 selected = self.conversations[self.message_index].latest
                 self.view_message_modal(selected)
+            elif key == ord("o"):
+                self.settings_modal()
             elif key == ord("f"):
                 self.fetch_current_folder()
             elif key == ord("F"):
                 self.fetch_all_folders()
             elif key == ord("d") and self.conversations:
-                selected_convo = self.conversations[self.message_index]
-                remote_deleted_count = 0
-                for msg in selected_convo.messages:
-                    if remote_delete_message(self.config, msg.folder, msg.remote_uid):
-                        remote_deleted_count += 1
-                    msg.folder = "Trash"
-                    save_message(msg)
-                moved_count = len(selected_convo.messages)
-                self.status = f"Conversation to Trash ({moved_count} msgs, {remote_deleted_count} remote)"
-                self.messages = load_messages(self.current_folder())
-                self.conversations = build_conversations(self.messages)
-                self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+                self.delete_selected_conversation_verified()
             elif key == ord("r") and self.conversations:
                 selected_convo = self.conversations[self.message_index]
                 mark_read = any(not m.read for m in selected_convo.messages)

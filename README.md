@@ -7,6 +7,7 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
 - Folder view: `Inbox`, `Sent`, `Drafts`, `Archive`, `Flagged`, `Trash`
 - Conversation view inside each folder (threads grouped by subject)
 - Message operations:
+  - `o`: Open Settings modal (reconfigure IMAP/SMTP/basic options)
   - `d`: Move selected conversation to Trash
   - `r`: Toggle Read/Unread for selected conversation
   - `s`: Send selected draft (from Drafts)
@@ -16,6 +17,7 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
   - `c`: Compose new message (opens compose modal)
     - In compose modal: `To`, `Cc`, `Bcc`, `Subject`, `Body` fields
     - `Tab`/`Shift+Tab` switch fields, arrow keys move cursor, `F2` saves draft, `F10`/`Esc`/`q` cancel
+  - In Settings modal: `F2` saves config, `F5` resets (deletes local DB + config, then re-setup)
   - Sending with `s` shows a confirmation dialog (`y`/`n`) before sending
   - `q`: Quit
   - arrow keys / hjkl for navigation
