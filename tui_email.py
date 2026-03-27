@@ -1892,5 +1892,9 @@ def main(stdscr):
     app.run()
 
 
-if __name__ == "__main__":
+def cli():
     curses.wrapper(main)
+
+
+if __name__ == "__main__":
+    cli()
