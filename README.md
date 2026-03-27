@@ -10,9 +10,13 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
   - `d`: Move selected conversation to Trash
   - `r`: Toggle Read/Unread for selected conversation
   - `s`: Send selected draft (from Drafts)
+  - `R`: Reply to selected message (opens prefilled compose)
+  - `W`: Forward selected message (opens prefilled compose)
   - `u`: Refresh from server (Update)
   - `c`: Compose new message (opens compose modal)
-    - In compose modal: `Tab`/`Shift+Tab` switch fields, `F2` saves draft, `F10`/`Esc`/`q` cancel
+    - In compose modal: `To`, `Cc`, `Bcc`, `Subject`, `Body` fields
+    - `Tab`/`Shift+Tab` switch fields, arrow keys move cursor, `F2` saves draft, `F10`/`Esc`/`q` cancel
+  - Sending with `s` shows a confirmation dialog (`y`/`n`) before sending
   - `q`: Quit
   - arrow keys / hjkl for navigation
 - SQLite persistence for messages in `~/.tui_email/messages.db`

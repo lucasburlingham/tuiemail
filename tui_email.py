@@ -26,6 +26,8 @@ class Message:
         subject,
         from_addr,
         to_addr,
+        cc_addr,
+        bcc_addr,
         date,
         body,
         read=False,
@@ -38,6 +40,8 @@ class Message:
         self.subject = subject
         self.from_addr = from_addr
         self.to_addr = to_addr
+        self.cc_addr = cc_addr
+        self.bcc_addr = bcc_addr
         self.date = date
         self.body = body
         self.read = read
@@ -125,6 +129,8 @@ def init_db():
             subject TEXT,
             from_addr TEXT,
             to_addr TEXT,
+            cc_addr TEXT,
+            bcc_addr TEXT,
             date TEXT,
             body TEXT,
             is_read INTEGER DEFAULT 0,
@@ -147,6 +153,10 @@ def init_db():
         c.execute("ALTER TABLE messages ADD COLUMN remote_uid TEXT")
     if "message_id" not in columns:
         c.execute("ALTER TABLE messages ADD COLUMN message_id TEXT")
+    if "cc_addr" not in columns:
+        c.execute("ALTER TABLE messages ADD COLUMN cc_addr TEXT")
+    if "bcc_addr" not in columns:
+        c.execute("ALTER TABLE messages ADD COLUMN bcc_addr TEXT")
     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_folder_uid ON messages(folder, remote_uid)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_messages_folder_mid ON messages(folder, message_id)")
     conn.close()
@@ -189,12 +199,14 @@ def save_message(msg):
     c = conn.cursor()
     if msg.id is None:
         c.execute(
-            "INSERT INTO messages (folder, subject, from_addr, to_addr, date, body, is_read, is_flagged, remote_uid, message_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages (folder, subject, from_addr, to_addr, cc_addr, bcc_addr, date, body, is_read, is_flagged, remote_uid, message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 msg.folder,
                 msg.subject,
                 msg.from_addr,
                 msg.to_addr,
+                msg.cc_addr,
+                msg.bcc_addr,
                 msg.date,
                 msg.body,
                 int(msg.read),
@@ -206,12 +218,14 @@ def save_message(msg):
         msg.id = c.lastrowid
     else:
         c.execute(
-            "UPDATE messages SET folder=?, subject=?, from_addr=?, to_addr=?, date=?, body=?, is_read=?, is_flagged=?, remote_uid=?, message_id=? WHERE id=?",
+            "UPDATE messages SET folder=?, subject=?, from_addr=?, to_addr=?, cc_addr=?, bcc_addr=?, date=?, body=?, is_read=?, is_flagged=?, remote_uid=?, message_id=? WHERE id=?",
             (
                 msg.folder,
                 msg.subject,
                 msg.from_addr,
                 msg.to_addr,
+                msg.cc_addr,
+                msg.bcc_addr,
                 msg.date,
                 msg.body,
                 int(msg.read),
@@ -248,12 +262,12 @@ def load_messages(folder=None):
     c = conn.cursor()
     if folder:
         c.execute(
-            "SELECT id, folder, subject, from_addr, to_addr, date, body, is_read, is_flagged, remote_uid, message_id FROM messages WHERE lower(folder)=lower(?) ORDER BY id DESC",
+            "SELECT id, folder, subject, from_addr, to_addr, cc_addr, bcc_addr, date, body, is_read, is_flagged, remote_uid, message_id FROM messages WHERE lower(folder)=lower(?) ORDER BY id DESC",
             (folder,),
         )
     else:
         c.execute(
-            "SELECT id, folder, subject, from_addr, to_addr, date, body, is_read, is_flagged, remote_uid, message_id FROM messages ORDER BY id DESC"
+            "SELECT id, folder, subject, from_addr, to_addr, cc_addr, bcc_addr, date, body, is_read, is_flagged, remote_uid, message_id FROM messages ORDER BY id DESC"
         )
     rows = c.fetchall()
     conn.close()
@@ -268,10 +282,12 @@ def load_messages(folder=None):
                 r[4],
                 r[5],
                 r[6],
-                bool(r[7]),
-                bool(r[8]),
-                remote_uid=r[9],
-                message_id=r[10],
+                r[7],
+                r[8],
+                bool(r[9]),
+                bool(r[10]),
+                remote_uid=r[11],
+                message_id=r[12],
             )
         )
     return msgs
@@ -398,6 +414,7 @@ def fetch_imap_messages(cfg, folder, fetch_limit=FETCH_LIMIT):
             subject = msg.get("Subject", "(No Subject)")
             from_addr = parseaddr(msg.get("From", ""))[1]
             to_addr = ", ".join([a[1] for a in getaddresses(msg.get_all("To", []))])
+            cc_addr = ", ".join([a[1] for a in getaddresses(msg.get_all("Cc", []))])
             date = msg.get("Date", "")
             message_id = (msg.get("Message-ID", "") or "").strip()
             body = ""
@@ -418,6 +435,8 @@ def fetch_imap_messages(cfg, folder, fetch_limit=FETCH_LIMIT):
                 subject,
                 from_addr,
                 to_addr,
+                cc_addr,
+                "",
                 date,
                 body,
                 read=read,
@@ -494,7 +513,15 @@ def send_draft_message(cfg, draft_msg):
     if not smtp_host:
         return False, "SMTP host missing in config"
 
-    recipients = [addr for _, addr in getaddresses([draft_msg.to_addr or ""]) if addr]
+    recipients = [
+        addr
+        for _, addr in getaddresses([
+            draft_msg.to_addr or "",
+            draft_msg.cc_addr or "",
+            draft_msg.bcc_addr or "",
+        ])
+        if addr
+    ]
     if not recipients:
         return False, "Draft has no valid recipient"
 
@@ -504,7 +531,9 @@ def send_draft_message(cfg, draft_msg):
 
     email_msg = EmailMessage()
     email_msg["From"] = from_addr
-    email_msg["To"] = ", ".join(recipients)
+    email_msg["To"] = draft_msg.to_addr or ""
+    if draft_msg.cc_addr:
+        email_msg["Cc"] = draft_msg.cc_addr
     email_msg["Subject"] = draft_msg.subject or "(No Subject)"
     email_msg.set_content(draft_msg.body or "")
 
@@ -563,6 +592,8 @@ class TUIEmail:
         self.folder_index = 0
         self.message_index = 0
         self.status = "Ready"
+        self.status_attr = curses.A_REVERSE
+        self.header_attr = curses.A_REVERSE | curses.A_BOLD
         self.messages = []
         self.conversations = []
 
@@ -607,7 +638,43 @@ class TUIEmail:
             text, cursor = self._insert_char(text, cursor, chr(key))
         return text, cursor
 
-    def _handle_body_key(self, key, lines, row, col):
+    def _wrap_lines(self, lines, width):
+        if width <= 0:
+            return lines or [""]
+
+        wrapped = []
+        for line in lines:
+            if line == "":
+                wrapped.append("")
+                continue
+
+            start = 0
+            while start < len(line):
+                wrapped.append(line[start : start + width])
+                start += width
+
+        return wrapped or [""]
+
+    def _cursor_to_index(self, lines, row, col):
+        index = 0
+        for i in range(min(row, len(lines))):
+            index += len(lines[i]) + 1
+        return index + col
+
+    def _index_to_cursor(self, lines, index):
+        if not lines:
+            return 0, 0
+
+        remaining = max(0, index)
+        for i, line in enumerate(lines):
+            line_len = len(line)
+            if remaining <= line_len:
+                return i, remaining
+            remaining -= line_len + 1
+
+        return len(lines) - 1, len(lines[-1])
+
+    def _handle_body_key(self, key, lines, row, col, wrap_width=None):
         current = lines[row]
 
         if key == curses.KEY_LEFT:
@@ -666,15 +733,95 @@ class TUIEmail:
             row = 0
             col = 0
 
+        if wrap_width:
+            cursor_index = self._cursor_to_index(lines, row, col)
+            lines = self._wrap_lines(lines, wrap_width)
+            row, col = self._index_to_cursor(lines, cursor_index)
+
         row = max(0, min(row, len(lines) - 1))
         col = max(0, min(col, len(lines[row])))
         return lines, row, col
 
-    def compose_modal(self):
+    def _prefixed_subject(self, subject, prefix):
+        subject = (subject or "").strip()
+        if subject.lower().startswith(prefix.lower() + ":"):
+            return subject
+        return f"{prefix}: {subject}" if subject else f"{prefix}: (No Subject)"
+
+    def _quote_body(self, text):
+        lines = (text or "").splitlines() or [""]
+        return "\n".join(f"> {line}" for line in lines)
+
+    def _build_reply_seed(self, msg):
+        return {
+            "title": "Reply",
+            "to": msg.from_addr or "",
+            "cc": "",
+            "bcc": "",
+            "subject": self._prefixed_subject(msg.subject, "Re"),
+            "body": f"\n\nOn {msg.date}, {msg.from_addr} wrote:\n{self._quote_body(msg.body)}",
+        }
+
+    def _build_forward_seed(self, msg):
+        forwarded = (
+            "\n\n---------- Forwarded message ----------\n"
+            f"From: {msg.from_addr}\n"
+            f"Date: {msg.date}\n"
+            f"Subject: {msg.subject}\n"
+            f"To: {msg.to_addr}\n\n"
+            f"{msg.body or ''}"
+        )
+        return {
+            "title": "Forward",
+            "to": "",
+            "cc": "",
+            "bcc": "",
+            "subject": self._prefixed_subject(msg.subject, "Fwd"),
+            "body": forwarded,
+        }
+
+    def confirm_send_modal(self, draft_msg):
         h, w = self.stdscr.getmaxyx()
-        modal_h = min(20, h - 2)
+        modal_h = min(12, h - 2)
+        modal_w = min(90, w - 4)
+        if modal_h < 8 or modal_w < 50:
+            return True
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        while True:
+            win.erase()
+            win.border()
+            win.addstr(0, 2, " Confirm Send ", curses.A_BOLD)
+            win.addstr(2, 2, f"To: {draft_msg.to_addr}"[: modal_w - 4])
+            win.addstr(3, 2, f"Cc: {draft_msg.cc_addr}"[: modal_w - 4])
+            win.addstr(4, 2, f"Bcc: {draft_msg.bcc_addr}"[: modal_w - 4])
+            win.addstr(5, 2, f"Subject: {draft_msg.subject}"[: modal_w - 4])
+            win.addstr(modal_h - 2, 2, "Send this draft? y:yes  n:no")
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("y"), ord("Y"), 10, 13, curses.KEY_ENTER):
+                return True
+            if key in (ord("n"), ord("N"), 27, ord("q"), ord("Q"), curses.KEY_EXIT):
+                return False
+
+    def compose_modal(
+        self,
+        title="Compose",
+        initial_to="",
+        initial_cc="",
+        initial_bcc="",
+        initial_subject="",
+        initial_body="",
+    ):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(24, h - 2)
         modal_w = min(88, w - 4)
-        if modal_h < 12 or modal_w < 50:
+        if modal_h < 16 or modal_w < 50:
             self.status = "Terminal too small for compose modal"
             return
 
@@ -683,40 +830,55 @@ class TUIEmail:
         win = curses.newwin(modal_h, modal_w, start_y, start_x)
         win.keypad(True)
 
-        to_text = ""
-        subject_text = ""
-        body_lines = [""]
-        active_field = 0  # 0=to, 1=subject, 2=body
-        to_cursor = 0
-        subject_cursor = 0
+        to_text = initial_to or ""
+        cc_text = initial_cc or ""
+        bcc_text = initial_bcc or ""
+        subject_text = initial_subject or ""
+        body_lines = (initial_body or "").splitlines() or [""]
+        active_field = 0  # 0=to, 1=cc, 2=bcc, 3=subject, 4=body
+        to_cursor = len(to_text)
+        cc_cursor = len(cc_text)
+        bcc_cursor = len(bcc_text)
+        subject_cursor = len(subject_text)
         body_row = 0
         body_col = 0
         body_scroll = 0
 
         to_y = 2
-        subject_y = 4
-        body_top = 7
+        cc_y = 4
+        bcc_y = 6
+        subject_y = 8
+        body_top = 11
         body_h = modal_h - body_top - 3
+        body_w = modal_w - 4
         field_x = 11
         field_w = modal_w - field_x - 2
+
+        body_lines = self._wrap_lines(body_lines, body_w)
 
         prev_cursor = curses.curs_set(1)
         try:
             while True:
                 win.erase()
                 win.border()
-                win.addstr(0, 2, " Compose ", curses.A_BOLD)
+                win.addstr(0, 2, f" {title} ", curses.A_BOLD)
                 win.addstr(modal_h - 2, 2, "Tab/Shift+Tab: field  F2: save  F10/Esc/q: cancel")
 
                 win.addstr(to_y, 2, "To:")
+                win.addstr(cc_y, 2, "Cc:")
+                win.addstr(bcc_y, 2, "Bcc:")
                 win.addstr(subject_y, 2, "Subject:")
                 win.addstr(body_top - 1, 2, "Body:")
 
                 to_attr = curses.A_REVERSE if active_field == 0 else curses.A_NORMAL
-                subject_attr = curses.A_REVERSE if active_field == 1 else curses.A_NORMAL
-                body_attr = curses.A_REVERSE if active_field == 2 else curses.A_NORMAL
+                cc_attr = curses.A_REVERSE if active_field == 1 else curses.A_NORMAL
+                bcc_attr = curses.A_REVERSE if active_field == 2 else curses.A_NORMAL
+                subject_attr = curses.A_REVERSE if active_field == 3 else curses.A_NORMAL
+                body_attr = curses.A_REVERSE if active_field == 4 else curses.A_NORMAL
 
                 win.addstr(to_y, field_x, to_text[:field_w].ljust(field_w), to_attr)
+                win.addstr(cc_y, field_x, cc_text[:field_w].ljust(field_w), cc_attr)
+                win.addstr(bcc_y, field_x, bcc_text[:field_w].ljust(field_w), bcc_attr)
                 win.addstr(subject_y, field_x, subject_text[:field_w].ljust(field_w), subject_attr)
 
                 for i in range(body_h):
@@ -727,6 +889,10 @@ class TUIEmail:
                 if active_field == 0:
                     win.move(to_y, field_x + min(to_cursor, field_w - 1))
                 elif active_field == 1:
+                    win.move(cc_y, field_x + min(cc_cursor, field_w - 1))
+                elif active_field == 2:
+                    win.move(bcc_y, field_x + min(bcc_cursor, field_w - 1))
+                elif active_field == 3:
                     win.move(subject_y, field_x + min(subject_cursor, field_w - 1))
                 else:
                     if body_row < body_scroll:
@@ -750,6 +916,8 @@ class TUIEmail:
                         subject_text.strip() or "(No Subject)",
                         self.config.get("imap_user", ""),
                         to_text.strip(),
+                        cc_text.strip(),
+                        bcc_text.strip(),
                         datetime.now().isoformat(timespec="seconds"),
                         "\n".join(body_lines).rstrip(),
                         read=True,
@@ -762,10 +930,10 @@ class TUIEmail:
                     self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
                     return
                 if key == 9:  # Tab
-                    active_field = (active_field + 1) % 3
+                    active_field = (active_field + 1) % 5
                     continue
                 if key == curses.KEY_BTAB:
-                    active_field = (active_field - 1) % 3
+                    active_field = (active_field - 1) % 5
                     continue
 
                 if active_field == 0:
@@ -777,12 +945,22 @@ class TUIEmail:
                     if key in (10, 13, curses.KEY_ENTER):
                         active_field = 2
                     else:
+                        cc_text, cc_cursor = self._handle_single_line_key(key, cc_text, cc_cursor)
+                elif active_field == 2:
+                    if key in (10, 13, curses.KEY_ENTER):
+                        active_field = 3
+                    else:
+                        bcc_text, bcc_cursor = self._handle_single_line_key(key, bcc_text, bcc_cursor)
+                elif active_field == 3:
+                    if key in (10, 13, curses.KEY_ENTER):
+                        active_field = 4
+                    else:
                         subject_text, subject_cursor = self._handle_single_line_key(
                             key, subject_text, subject_cursor
                         )
                 else:
                     body_lines, body_row, body_col = self._handle_body_key(
-                        key, body_lines, body_row, body_col
+                        key, body_lines, body_row, body_col, wrap_width=body_w
                     )
         finally:
             curses.curs_set(prev_cursor)
@@ -839,24 +1017,33 @@ class TUIEmail:
             self.stdscr.refresh()
             return
 
+        yoff = 1
+        username = self.config.get("imap_user", "unknown")
+        year = datetime.now().year
+        header_text = f"{username} | TUI Email | (C) Lucas Burlingham {year}"
+        header_display = header_text[: max(0, w - 1)]
+        header_x = max(0, (w - len(header_display)) // 2)
+        self.stdscr.addstr(0, 0, " " * (w - 1), self.header_attr)
+        self.stdscr.addstr(0, header_x, header_display, self.header_attr)
+
         folder_w = 20
         list_w = 40
         detail_w = w - folder_w - list_w - 4
 
-        self.stdscr.addstr(0, 0, "Folders", curses.A_BOLD | curses.A_UNDERLINE)
+        self.stdscr.addstr(yoff + 0, 0, "Folders", curses.A_BOLD | curses.A_UNDERLINE)
         for i, folder in enumerate(self.folders):
             attr = curses.A_REVERSE if i == self.folder_index else curses.A_NORMAL
             ts = self.last_fetch.get(folder)
             ts_str = ts.strftime("%H:%M") if ts else "--:--"
             label = f"{folder} [{ts_str}]"
-            self.stdscr.addstr(1 + i, 0, label[:folder_w-1].ljust(folder_w-1), attr)
+            self.stdscr.addstr(yoff + 1 + i, 0, label[:folder_w-1].ljust(folder_w-1), attr)
 
-        self.stdscr.addstr(0, folder_w + 1, "Messages", curses.A_BOLD | curses.A_UNDERLINE)
+        self.stdscr.addstr(yoff + 0, folder_w + 1, "Messages", curses.A_BOLD | curses.A_UNDERLINE)
         self.messages = load_messages(self.current_folder())
         self.conversations = build_conversations(self.messages)
         if self.message_index >= len(self.conversations):
             self.message_index = max(0, len(self.conversations) - 1)
-        for i, convo in enumerate(self.conversations[:h-6]):
+        for i, convo in enumerate(self.conversations[: max(0, h - 7)]):
             attrs = curses.A_REVERSE if i == self.message_index else curses.A_NORMAL
             unread = convo.unread_count
             prefix = "*" if unread > 0 else " "
@@ -864,36 +1051,49 @@ class TUIEmail:
             subject_part = convo.subject[:18]
             count_part = f"({len(convo.messages)})"
             line = f"{prefix} {from_part:10} {subject_part:18} {count_part}"
-            self.stdscr.addstr(1 + i, folder_w + 1, line[:list_w-1], attrs)
+            self.stdscr.addstr(yoff + 1 + i, folder_w + 1, line[:list_w-1], attrs)
 
         detail_x = folder_w + list_w + 2
-        self.stdscr.addstr(0, detail_x, "Detail", curses.A_BOLD | curses.A_UNDERLINE)
+        self.stdscr.addstr(yoff + 0, detail_x, "Detail", curses.A_BOLD | curses.A_UNDERLINE)
         if self.conversations:
             selected_convo = self.conversations[self.message_index]
             selected = selected_convo.latest
-            self.stdscr.addstr(1, detail_x, f"Subject: {selected_convo.subject}"[:detail_w])
-            self.stdscr.addstr(2, detail_x, f"Messages: {len(selected_convo.messages)}  Unread: {selected_convo.unread_count}"[:detail_w])
-            self.stdscr.addstr(3, detail_x, f"From: {selected.from_addr}"[:detail_w])
-            self.stdscr.addstr(4, detail_x, f"To: {selected.to_addr}"[:detail_w])
-            self.stdscr.addstr(5, detail_x, f"Date: {selected.date}"[:detail_w])
+            self.stdscr.addstr(yoff + 1, detail_x, f"Subject: {selected_convo.subject}"[:detail_w])
+            self.stdscr.addstr(yoff + 2, detail_x, f"Messages: {len(selected_convo.messages)}  Unread: {selected_convo.unread_count}"[:detail_w])
+            self.stdscr.addstr(yoff + 3, detail_x, f"From: {selected.from_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 4, detail_x, f"To: {selected.to_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 5, detail_x, f"Cc: {selected.cc_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 6, detail_x, f"Date: {selected.date}"[:detail_w])
 
-            thread_rows = max(0, min(5, h - 16))
-            self.stdscr.addstr(7, detail_x, "Thread:", curses.A_BOLD)
+            thread_rows = max(0, min(4, h - 17))
+            self.stdscr.addstr(yoff + 8, detail_x, "Thread:", curses.A_BOLD)
             for idx, thread_msg in enumerate(selected_convo.messages[:thread_rows]):
                 marker = "*" if not thread_msg.read else " "
                 thread_line = f"{marker} {thread_msg.date[:12]:12} {thread_msg.from_addr[:12]:12}"
-                self.stdscr.addstr(8 + idx, detail_x, thread_line[:detail_w])
+                self.stdscr.addstr(yoff + 9 + idx, detail_x, thread_line[:detail_w])
 
-            body_start = 9 + thread_rows
+            body_start = yoff + 10 + thread_rows
             body_lines = selected.body.splitlines()
             for idx, line in enumerate(body_lines[: max(0, h - body_start - 3)]):
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
 
-        self.stdscr.addstr(h-2, 0, "q:Quit c:Compose s:SendDraft f:Fetch F:FetchAll ←/→ Folder ↑/↓ Conv d:ToTrash r:ToggleRead    " + self.status)
+        status_text = f"Status: {self.status}"
+        self.stdscr.addstr(h - 3, 0, " " * (w - 1), self.status_attr)
+        self.stdscr.addstr(h - 3, 1, status_text[: max(0, w - 3)], self.status_attr)
+
+        shortcut_line = "q:Quit c:Compose R:Reply W:Forward s:SendDraft f:Fetch F:FetchAll ←/→ Folder ↑/↓ Conv d:ToTrash r:ToggleRead"
+        self.stdscr.addstr(h - 2, 0, shortcut_line[: w - 1])
         self.stdscr.refresh()
 
     def run(self):
         curses.curs_set(0)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+            self.status_attr = curses.color_pair(1) | curses.A_BOLD
+            self.header_attr = curses.color_pair(2) | curses.A_BOLD
         while True:
             self._draw()
             key = self.stdscr.getch()
@@ -942,6 +1142,9 @@ class TUIEmail:
                     continue
 
                 draft = self.conversations[self.message_index].latest
+                if not self.confirm_send_modal(draft):
+                    self.status = "Send cancelled"
+                    continue
                 ok, message = send_draft_message(self.config, draft)
                 if not ok:
                     self.status = message
@@ -956,6 +1159,28 @@ class TUIEmail:
                 self.conversations = build_conversations(self.messages)
                 self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
                 self.status = f"Draft sent to {draft.to_addr or '(unknown)'}"
+            elif key == ord("R") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                seed = self._build_reply_seed(selected)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+            elif key == ord("W") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                seed = self._build_forward_seed(selected)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
             elif key == ord("c"):
                 self.compose_modal()
 
