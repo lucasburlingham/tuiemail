@@ -488,18 +488,20 @@ def fetch_imap_messages(cfg, folder, fetch_limit=FETCH_LIMIT):
         if typ != "OK":
             imap.logout()
             return None
-        typ, data = imap.search(None, "ALL")
+        # Fetch and store true IMAP UIDs so later UID commands (delete/flags)
+        # target the correct server-side message.
+        typ, data = imap.uid("SEARCH", None, "ALL")
         if typ != "OK":
             imap.logout()
             return None
-        ids = data[0].split() if data and data[0] else []
+        uids = data[0].split() if data and data[0] else []
         # Keep sync quick by optionally fetching only the newest N messages.
         # Use fetch_limit <= 0 to fetch the complete folder.
         if fetch_limit > 0:
-            ids = ids[-fetch_limit:]
+            uids = uids[-fetch_limit:]
         messages = []
-        for uid in ids:
-            typ, msgdata = imap.fetch(uid, "(RFC822 FLAGS)")
+        for uid in uids:
+            typ, msgdata = imap.uid("FETCH", uid, "(RFC822 FLAGS)")
             if typ != "OK" or not msgdata or not msgdata[0]:
                 continue
             raw = None
