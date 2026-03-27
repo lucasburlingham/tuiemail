@@ -7,6 +7,7 @@ import smtplib
 import ssl
 import email
 import re
+import textwrap
 from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
 from pathlib import Path
@@ -1009,6 +1010,22 @@ class TUIEmail:
             f"({len(self.folders)-failed}/{len(self.folders)} folders)"
         )
 
+    def _wrap_shortcuts(self, items, max_width):
+        if max_width <= 0:
+            return [""]
+        lines = []
+        current = ""
+        for item in items:
+            candidate = item if not current else f"{current}  {item}"
+            if len(candidate) <= max_width or not current:
+                current = candidate
+            else:
+                lines.append(current)
+                current = item
+        if current:
+            lines.append(current)
+        return lines or [""]
+
     def _draw(self):
         self.stdscr.clear()
         h, w = self.stdscr.getmaxyx()
@@ -1025,6 +1042,24 @@ class TUIEmail:
         header_x = max(0, (w - len(header_display)) // 2)
         self.stdscr.addstr(0, 0, " " * (w - 1), self.header_attr)
         self.stdscr.addstr(0, header_x, header_display, self.header_attr)
+
+        shortcut_items = [
+            "q:Quit",
+            "c:Compose",
+            "R:Reply",
+            "W:Forward",
+            "s:SendDraft",
+            "f:Fetch",
+            "F:FetchAll",
+            "←/→ Folder",
+            "↑/↓ Conv",
+            "d:ToTrash",
+            "r:ToggleRead",
+        ]
+        shortcut_lines = self._wrap_shortcuts(shortcut_items, w - 1)
+        footer_rows = 1 + len(shortcut_lines)  # status + wrapped shortcut lines
+        footer_top = h - footer_rows
+        content_bottom = footer_top - 1
 
         folder_w = 20
         list_w = 40
@@ -1043,7 +1078,8 @@ class TUIEmail:
         self.conversations = build_conversations(self.messages)
         if self.message_index >= len(self.conversations):
             self.message_index = max(0, len(self.conversations) - 1)
-        for i, convo in enumerate(self.conversations[: max(0, h - 7)]):
+        max_message_rows = max(0, content_bottom - (yoff + 1) + 1)
+        for i, convo in enumerate(self.conversations[:max_message_rows]):
             attrs = curses.A_REVERSE if i == self.message_index else curses.A_NORMAL
             unread = convo.unread_count
             prefix = "*" if unread > 0 else " "
@@ -1074,15 +1110,31 @@ class TUIEmail:
 
             body_start = yoff + 10 + thread_rows
             body_lines = selected.body.splitlines()
-            for idx, line in enumerate(body_lines[: max(0, h - body_start - 3)]):
+            wrapped_body_lines = []
+            wrap_width = max(1, detail_w)
+            for raw_line in body_lines:
+                if raw_line == "":
+                    wrapped_body_lines.append("")
+                    continue
+                wrapped = textwrap.wrap(
+                    raw_line,
+                    width=wrap_width,
+                    replace_whitespace=False,
+                    drop_whitespace=False,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                )
+                wrapped_body_lines.extend(wrapped or [""])
+            max_body_rows = max(0, content_bottom - body_start + 1)
+            for idx, line in enumerate(wrapped_body_lines[:max_body_rows]):
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
 
         status_text = f"Status: {self.status}"
-        self.stdscr.addstr(h - 3, 0, " " * (w - 1), self.status_attr)
-        self.stdscr.addstr(h - 3, 1, status_text[: max(0, w - 3)], self.status_attr)
-
-        shortcut_line = "q:Quit c:Compose R:Reply W:Forward s:SendDraft f:Fetch F:FetchAll ←/→ Folder ↑/↓ Conv d:ToTrash r:ToggleRead"
-        self.stdscr.addstr(h - 2, 0, shortcut_line[: w - 1])
+        self.stdscr.addstr(footer_top, 0, " " * (w - 1), self.status_attr)
+        self.stdscr.addstr(footer_top, 1, status_text[: max(0, w - 3)], self.status_attr)
+        for i, line in enumerate(shortcut_lines):
+            self.stdscr.addstr(footer_top + 1 + i, 0, " " * (w - 1))
+            self.stdscr.addstr(footer_top + 1 + i, 0, line[: w - 1])
         self.stdscr.refresh()
 
     def run(self):
