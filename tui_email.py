@@ -3,8 +3,11 @@ import curses
 import json
 import sqlite3
 import imaplib
+import smtplib
+import ssl
 import email
 import re
+from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
 from pathlib import Path
 from datetime import datetime
@@ -469,6 +472,62 @@ def remote_delete_message(cfg, folder, remote_uid):
         return False
 
 
+def _guess_smtp_host(imap_host):
+    if not imap_host:
+        return ""
+    if imap_host.lower().startswith("imap."):
+        return "smtp." + imap_host[5:]
+    return imap_host
+
+
+def send_draft_message(cfg, draft_msg):
+    if not draft_msg:
+        return False, "No draft selected"
+
+    smtp_host = cfg.get("smtp_host") or _guess_smtp_host(cfg.get("imap_host", ""))
+    smtp_port = int(cfg.get("smtp_port", 587))
+    smtp_ssl = bool(cfg.get("smtp_ssl", False))
+    smtp_starttls = bool(cfg.get("smtp_starttls", not smtp_ssl))
+    smtp_user = cfg.get("smtp_user") or cfg.get("imap_user", "")
+    smtp_pass = cfg.get("smtp_pass") or cfg.get("imap_pass", "")
+
+    if not smtp_host:
+        return False, "SMTP host missing in config"
+
+    recipients = [addr for _, addr in getaddresses([draft_msg.to_addr or ""]) if addr]
+    if not recipients:
+        return False, "Draft has no valid recipient"
+
+    from_addr = draft_msg.from_addr or smtp_user
+    if not from_addr:
+        return False, "From address missing"
+
+    email_msg = EmailMessage()
+    email_msg["From"] = from_addr
+    email_msg["To"] = ", ".join(recipients)
+    email_msg["Subject"] = draft_msg.subject or "(No Subject)"
+    email_msg.set_content(draft_msg.body or "")
+
+    try:
+        if smtp_ssl:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=20) as server:
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(email_msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+                server.ehlo()
+                if smtp_starttls:
+                    server.starttls(context=ssl.create_default_context())
+                    server.ehlo()
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(email_msg)
+        return True, "Sent"
+    except Exception as exc:
+        return False, f"Send failed: {exc}"
+
+
 def setup_configuration(stdscr):
     cfg = load_config()
     fields = [
@@ -524,6 +583,209 @@ class TUIEmail:
         self.last_fetch = {}
         self.messages = load_messages(self.current_folder())
         self.conversations = build_conversations(self.messages)
+
+    def _insert_char(self, text, cursor, ch):
+        return text[:cursor] + ch + text[cursor:], cursor + 1
+
+    def _handle_single_line_key(self, key, text, cursor):
+        if key in (curses.KEY_LEFT,):
+            cursor = max(0, cursor - 1)
+        elif key in (curses.KEY_RIGHT,):
+            cursor = min(len(text), cursor + 1)
+        elif key in (curses.KEY_HOME,):
+            cursor = 0
+        elif key in (curses.KEY_END,):
+            cursor = len(text)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if cursor > 0:
+                text = text[: cursor - 1] + text[cursor:]
+                cursor -= 1
+        elif key == curses.KEY_DC:
+            if cursor < len(text):
+                text = text[:cursor] + text[cursor + 1 :]
+        elif 32 <= key <= 126:
+            text, cursor = self._insert_char(text, cursor, chr(key))
+        return text, cursor
+
+    def _handle_body_key(self, key, lines, row, col):
+        current = lines[row]
+
+        if key == curses.KEY_LEFT:
+            if col > 0:
+                col -= 1
+            elif row > 0:
+                row -= 1
+                col = len(lines[row])
+        elif key == curses.KEY_RIGHT:
+            if col < len(current):
+                col += 1
+            elif row < len(lines) - 1:
+                row += 1
+                col = 0
+        elif key == curses.KEY_UP:
+            if row > 0:
+                row -= 1
+                col = min(col, len(lines[row]))
+        elif key == curses.KEY_DOWN:
+            if row < len(lines) - 1:
+                row += 1
+                col = min(col, len(lines[row]))
+        elif key == curses.KEY_HOME:
+            col = 0
+        elif key == curses.KEY_END:
+            col = len(current)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if col > 0:
+                lines[row] = current[: col - 1] + current[col:]
+                col -= 1
+            elif row > 0:
+                prev_len = len(lines[row - 1])
+                lines[row - 1] += current
+                del lines[row]
+                row -= 1
+                col = prev_len
+        elif key == curses.KEY_DC:
+            if col < len(current):
+                lines[row] = current[:col] + current[col + 1 :]
+            elif row < len(lines) - 1:
+                lines[row] += lines[row + 1]
+                del lines[row + 1]
+        elif key in (10, 13, curses.KEY_ENTER):
+            left = current[:col]
+            right = current[col:]
+            lines[row] = left
+            lines.insert(row + 1, right)
+            row += 1
+            col = 0
+        elif 32 <= key <= 126:
+            lines[row] = current[:col] + chr(key) + current[col:]
+            col += 1
+
+        if not lines:
+            lines.append("")
+            row = 0
+            col = 0
+
+        row = max(0, min(row, len(lines) - 1))
+        col = max(0, min(col, len(lines[row])))
+        return lines, row, col
+
+    def compose_modal(self):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(20, h - 2)
+        modal_w = min(88, w - 4)
+        if modal_h < 12 or modal_w < 50:
+            self.status = "Terminal too small for compose modal"
+            return
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        to_text = ""
+        subject_text = ""
+        body_lines = [""]
+        active_field = 0  # 0=to, 1=subject, 2=body
+        to_cursor = 0
+        subject_cursor = 0
+        body_row = 0
+        body_col = 0
+        body_scroll = 0
+
+        to_y = 2
+        subject_y = 4
+        body_top = 7
+        body_h = modal_h - body_top - 3
+        field_x = 11
+        field_w = modal_w - field_x - 2
+
+        prev_cursor = curses.curs_set(1)
+        try:
+            while True:
+                win.erase()
+                win.border()
+                win.addstr(0, 2, " Compose ", curses.A_BOLD)
+                win.addstr(modal_h - 2, 2, "Tab/Shift+Tab: field  F2: save  F10/Esc/q: cancel")
+
+                win.addstr(to_y, 2, "To:")
+                win.addstr(subject_y, 2, "Subject:")
+                win.addstr(body_top - 1, 2, "Body:")
+
+                to_attr = curses.A_REVERSE if active_field == 0 else curses.A_NORMAL
+                subject_attr = curses.A_REVERSE if active_field == 1 else curses.A_NORMAL
+                body_attr = curses.A_REVERSE if active_field == 2 else curses.A_NORMAL
+
+                win.addstr(to_y, field_x, to_text[:field_w].ljust(field_w), to_attr)
+                win.addstr(subject_y, field_x, subject_text[:field_w].ljust(field_w), subject_attr)
+
+                for i in range(body_h):
+                    idx = body_scroll + i
+                    line = body_lines[idx] if idx < len(body_lines) else ""
+                    win.addstr(body_top + i, 2, line[: modal_w - 4].ljust(modal_w - 4), body_attr)
+
+                if active_field == 0:
+                    win.move(to_y, field_x + min(to_cursor, field_w - 1))
+                elif active_field == 1:
+                    win.move(subject_y, field_x + min(subject_cursor, field_w - 1))
+                else:
+                    if body_row < body_scroll:
+                        body_scroll = body_row
+                    if body_row >= body_scroll + body_h:
+                        body_scroll = body_row - body_h + 1
+                    cursor_y = body_top + (body_row - body_scroll)
+                    cursor_x = 2 + min(body_col, modal_w - 5)
+                    win.move(cursor_y, cursor_x)
+
+                win.refresh()
+                key = win.getch()
+
+                if key in (27, curses.KEY_EXIT, curses.KEY_F10, ord("q"), ord("Q")):
+                    self.status = "Compose cancelled"
+                    return
+                if key in (19, curses.KEY_F2):  # Ctrl+S or F2
+                    draft = Message(
+                        None,
+                        "Drafts",
+                        subject_text.strip() or "(No Subject)",
+                        self.config.get("imap_user", ""),
+                        to_text.strip(),
+                        datetime.now().isoformat(timespec="seconds"),
+                        "\n".join(body_lines).rstrip(),
+                        read=True,
+                        flagged=False,
+                    )
+                    save_message(draft)
+                    self.status = "Draft saved"
+                    self.messages = load_messages(self.current_folder())
+                    self.conversations = build_conversations(self.messages)
+                    self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+                    return
+                if key == 9:  # Tab
+                    active_field = (active_field + 1) % 3
+                    continue
+                if key == curses.KEY_BTAB:
+                    active_field = (active_field - 1) % 3
+                    continue
+
+                if active_field == 0:
+                    if key in (10, 13, curses.KEY_ENTER):
+                        active_field = 1
+                    else:
+                        to_text, to_cursor = self._handle_single_line_key(key, to_text, to_cursor)
+                elif active_field == 1:
+                    if key in (10, 13, curses.KEY_ENTER):
+                        active_field = 2
+                    else:
+                        subject_text, subject_cursor = self._handle_single_line_key(
+                            key, subject_text, subject_cursor
+                        )
+                else:
+                    body_lines, body_row, body_col = self._handle_body_key(
+                        key, body_lines, body_row, body_col
+                    )
+        finally:
+            curses.curs_set(prev_cursor)
 
     def current_folder(self):
         return self.folders[self.folder_index] if self.folders else "Inbox"
@@ -627,7 +889,7 @@ class TUIEmail:
             for idx, line in enumerate(body_lines[: max(0, h - body_start - 3)]):
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
 
-        self.stdscr.addstr(h-2, 0, "q:Quit f:Fetch F:FetchAll ←/→ Folder ↑/↓ Conv d:ToTrash r:ToggleRead    " + self.status)
+        self.stdscr.addstr(h-2, 0, "q:Quit c:Compose s:SendDraft f:Fetch F:FetchAll ←/→ Folder ↑/↓ Conv d:ToTrash r:ToggleRead    " + self.status)
         self.stdscr.refresh()
 
     def run(self):
@@ -671,6 +933,31 @@ class TUIEmail:
                     msg.read = mark_read
                     save_message(msg)
                 self.status = "Conversation marked read" if mark_read else "Conversation marked unread"
+            elif key == ord("s"):
+                if self.current_folder().lower() != "drafts":
+                    self.status = "Open Drafts to send"
+                    continue
+                if not self.conversations:
+                    self.status = "No draft selected"
+                    continue
+
+                draft = self.conversations[self.message_index].latest
+                ok, message = send_draft_message(self.config, draft)
+                if not ok:
+                    self.status = message
+                    continue
+
+                draft.folder = "Sent"
+                draft.read = True
+                draft.date = datetime.now().isoformat(timespec="seconds")
+                save_message(draft)
+
+                self.messages = load_messages(self.current_folder())
+                self.conversations = build_conversations(self.messages)
+                self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+                self.status = f"Draft sent to {draft.to_addr or '(unknown)'}"
+            elif key == ord("c"):
+                self.compose_modal()
 
 
 def main(stdscr):

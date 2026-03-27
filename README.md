@@ -11,7 +11,8 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
   - `r`: Toggle Read/Unread for selected conversation
   - `s`: Send selected draft (from Drafts)
   - `u`: Refresh from server (Update)
-  - `n`: Compose new message
+  - `c`: Compose new message (opens compose modal)
+    - In compose modal: `Tab`/`Shift+Tab` switch fields, `F2` saves draft, `F10`/`Esc`/`q` cancel
   - `q`: Quit
   - arrow keys / hjkl for navigation
 - SQLite persistence for messages in `~/.tui_email/messages.db`
@@ -22,6 +23,14 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
 On first run, the client will prompt for:
 
 - IMAP host/port/ssl/username/password
+
+For sending drafts with `s`, SMTP defaults are inferred from IMAP settings. You can add optional overrides in `~/.tui_email/config.json`:
+
+- `smtp_host`
+- `smtp_port` (default `587`)
+- `smtp_ssl` (default `false`)
+- `smtp_starttls` (default `true` when `smtp_ssl` is `false`)
+- `smtp_user` / `smtp_pass` (default to IMAP credentials)
 
 This is a one-time setup. The config is written to `~/.tui_email/config.json`.
 
@@ -45,7 +54,7 @@ python3 tui_email.py
 - UI is shown immediately using cached data from DB.
 - Background sync (`sync_all`) updates folders sequentially with Inbox first, writing to DB using `save_message`.
 - `p` key triggers manual refresh via `sync_all`.
-- Read/unread/delete actions are persisted to DB immediately via `save_message`. 
+- Read/unread/delete actions are persisted to DB immediately via `save_message`.
 
 ## Dependencies
 
