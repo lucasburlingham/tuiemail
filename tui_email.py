@@ -716,6 +716,9 @@ class TUIEmail:
         self.status = "Ready"
         self.status_attr = curses.A_REVERSE
         self.header_attr = curses.A_REVERSE | curses.A_BOLD
+        self.detail_scroll = 0
+        self.detail_scroll_max = 0
+        self.detail_body_rect = None
         self.messages = []
         self.conversations = []
 
@@ -1280,6 +1283,8 @@ class TUIEmail:
             "F:FetchAll",
             "←/→ Folder",
             "↑/↓ Conv",
+            "PgUp/PgDn:Body",
+            "[ / ]:Body",
             "d:ToTrash",
             "r:ToggleRead",
         ]
@@ -1317,6 +1322,8 @@ class TUIEmail:
             self.stdscr.addstr(yoff + 1 + i, folder_w + 1, line[:list_w-1], attrs)
 
         detail_x = folder_w + list_w + 2
+        self.detail_body_rect = None
+        self.detail_scroll_max = 0
         self.stdscr.addstr(yoff + 0, detail_x, "Detail", curses.A_BOLD | curses.A_UNDERLINE)
         if self.conversations:
             selected_convo = self.conversations[self.message_index]
@@ -1338,7 +1345,11 @@ class TUIEmail:
             body_start = yoff + 10 + thread_rows
             wrapped_body_lines = self._wrap_body_for_width(selected.body, detail_w)
             max_body_rows = max(0, content_bottom - body_start + 1)
-            for idx, line in enumerate(wrapped_body_lines[:max_body_rows]):
+            self.detail_scroll_max = max(0, len(wrapped_body_lines) - max_body_rows)
+            self.detail_scroll = max(0, min(self.detail_scroll, self.detail_scroll_max))
+            self.detail_body_rect = (detail_x, body_start, detail_x + detail_w - 1, content_bottom)
+            visible_lines = wrapped_body_lines[self.detail_scroll : self.detail_scroll + max_body_rows]
+            for idx, line in enumerate(visible_lines):
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
 
         status_text = f"Status: {self.status}"
@@ -1370,13 +1381,46 @@ class TUIEmail:
             elif key in (curses.KEY_LEFT, ord("h")):
                 self.folder_index = max(0, self.folder_index - 1)
                 self.message_index = 0
+                self.detail_scroll = 0
             elif key in (curses.KEY_RIGHT, ord("l")):
                 self.folder_index = min(len(self.folders) - 1, self.folder_index + 1)
                 self.message_index = 0
+                self.detail_scroll = 0
             elif key in (curses.KEY_UP, ord("k")):
                 self.message_index = max(0, self.message_index - 1)
+                self.detail_scroll = 0
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.message_index = min(len(self.conversations) - 1, self.message_index + 1)
+                self.detail_scroll = 0
+            elif key in (curses.KEY_PPAGE, ord("[")) and self.conversations:
+                self.detail_scroll = max(0, self.detail_scroll - 5)
+            elif key in (curses.KEY_NPAGE, ord("]")) and self.conversations:
+                self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 5)
+            elif key == curses.KEY_MOUSE and self.conversations and self.detail_body_rect:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+
+                x1, y1, x2, y2 = self.detail_body_rect
+                if not (x1 <= mx <= x2 and y1 <= my <= y2):
+                    continue
+
+                wheel_up_mask = (
+                    getattr(curses, "BUTTON4_PRESSED", 0)
+                    | getattr(curses, "BUTTON4_RELEASED", 0)
+                    | getattr(curses, "BUTTON4_CLICKED", 0)
+                )
+                wheel_down_mask = (
+                    getattr(curses, "BUTTON5_PRESSED", 0)
+                    | getattr(curses, "BUTTON5_RELEASED", 0)
+                    | getattr(curses, "BUTTON5_CLICKED", 0)
+                )
+
+                if bstate & wheel_up_mask:
+                    self.detail_scroll = max(0, self.detail_scroll - 3)
+                elif bstate & wheel_down_mask:
+                    self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 3)
             elif key == ord(" ") and self.conversations:
                 selected = self.conversations[self.message_index].latest
                 self.view_message_modal(selected)
