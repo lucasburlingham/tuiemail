@@ -6,8 +6,10 @@ import imaplib
 import smtplib
 import ssl
 import email
+import html
 import re
 import textwrap
+from html.parser import HTMLParser
 from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
 from pathlib import Path
@@ -372,6 +374,108 @@ def _payload_to_text(payload, charset):
     return str(payload)
 
 
+class _TerminalHTMLRenderer(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.href_stack = []
+        self.ignored_depth = 0
+        self.in_pre = False
+
+    def handle_starttag(self, tag, attrs):
+        tag = (tag or "").lower()
+        if tag in {"script", "style", "noscript"}:
+            self.ignored_depth += 1
+            return
+        if self.ignored_depth > 0:
+            return
+
+        if tag == "pre":
+            self.in_pre = True
+
+        if tag in {"br", "hr"}:
+            self.parts.append("\n")
+        elif tag in {"p", "div", "section", "article", "header", "footer", "tr"}:
+            self.parts.append("\n")
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n- ")
+
+        if tag == "a":
+            href = ""
+            for key, value in attrs:
+                if (key or "").lower() == "href" and value:
+                    href = value.strip()
+                    break
+            self.href_stack.append(href)
+
+    def handle_endtag(self, tag):
+        tag = (tag or "").lower()
+        if tag in {"script", "style", "noscript"}:
+            if self.ignored_depth > 0:
+                self.ignored_depth -= 1
+            return
+        if self.ignored_depth > 0:
+            return
+
+        if tag == "a":
+            href = self.href_stack.pop() if self.href_stack else ""
+            if href:
+                self.parts.append(f" ({href})")
+
+        if tag == "pre":
+            self.in_pre = False
+
+        if tag in {"p", "div", "section", "article", "header", "footer", "tr", "li"}:
+            self.parts.append("\n")
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if self.ignored_depth > 0 or data is None:
+            return
+        text = html.unescape(data)
+        if not self.in_pre:
+            text = re.sub(r"\s+", " ", text)
+        if text:
+            self.parts.append(text)
+
+    def text(self):
+        raw = "".join(self.parts)
+        raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.rstrip() for line in raw.split("\n")]
+
+        normalized = []
+        previous_blank = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if not previous_blank:
+                    normalized.append("")
+                previous_blank = True
+            else:
+                normalized.append(stripped)
+                previous_blank = False
+        return "\n".join(normalized).strip()
+
+
+def html_to_terminal_text(html_text):
+    if not html_text:
+        return ""
+    parser = _TerminalHTMLRenderer()
+    try:
+        parser.feed(html_text)
+        parser.close()
+    except Exception:
+        # Fallback to basic tag removal if malformed HTML breaks parsing.
+        fallback = re.sub(r"<[^>]+>", " ", html_text)
+        fallback = html.unescape(fallback)
+        fallback = re.sub(r"\s+", " ", fallback)
+        return fallback.strip()
+    return parser.text()
+
+
 def fetch_imap_messages(cfg, folder, fetch_limit=FETCH_LIMIT):
     if not cfg or not cfg.get("imap_host") or not cfg.get("imap_user") or not cfg.get("imap_pass"):
         return None
@@ -420,13 +524,30 @@ def fetch_imap_messages(cfg, folder, fetch_limit=FETCH_LIMIT):
             message_id = (msg.get("Message-ID", "") or "").strip()
             body = ""
             if msg.is_multipart():
+                plain_parts = []
+                html_parts = []
                 for part in msg.walk():
-                    if part.get_content_type() == "text/plain" and not part.get("Content-Disposition"):
-                        charset = part.get_content_charset() or "utf-8"
-                        body += _payload_to_text(part.get_payload(decode=True), charset)
+                    content_disposition = part.get("Content-Disposition")
+                    if content_disposition:
+                        continue
+                    content_type = part.get_content_type()
+                    charset = part.get_content_charset() or "utf-8"
+                    payload_text = _payload_to_text(part.get_payload(decode=True), charset)
+                    if content_type == "text/plain":
+                        plain_parts.append(payload_text)
+                    elif content_type == "text/html":
+                        html_parts.append(payload_text)
+                if plain_parts:
+                    body = "\n".join(p for p in plain_parts if p)
+                elif html_parts:
+                    body = html_to_terminal_text("\n".join(p for p in html_parts if p))
             else:
                 charset = msg.get_content_charset() or "utf-8"
-                body = _payload_to_text(msg.get_payload(decode=True), charset)
+                payload_text = _payload_to_text(msg.get_payload(decode=True), charset)
+                if msg.get_content_type() == "text/html":
+                    body = html_to_terminal_text(payload_text)
+                else:
+                    body = payload_text
             read = "\\Seen" in flags
             flagged = "\\Flagged" in flags
             uid_str = uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid)
