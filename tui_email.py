@@ -740,6 +740,18 @@ class TUIEmail:
     def _insert_char(self, text, cursor, ch):
         return text[:cursor] + ch + text[cursor:], cursor + 1
 
+    def _draw_ascii_modal_border(self, win):
+        win.border(
+            ord("|"),
+            ord("|"),
+            ord("-"),
+            ord("-"),
+            ord("+"),
+            ord("+"),
+            ord("+"),
+            ord("+"),
+        )
+
     def _handle_single_line_key(self, key, text, cursor):
         if key in (curses.KEY_LEFT,):
             cursor = max(0, cursor - 1)
@@ -916,7 +928,7 @@ class TUIEmail:
 
         while True:
             win.erase()
-            win.border()
+            self._draw_ascii_modal_border(win)
             win.addstr(0, 2, " Confirm Send ", curses.A_BOLD)
             win.addstr(2, 2, f"To: {draft_msg.to_addr}"[: modal_w - 4])
             win.addstr(3, 2, f"Cc: {draft_msg.cc_addr}"[: modal_w - 4])
@@ -982,7 +994,7 @@ class TUIEmail:
         try:
             while True:
                 win.erase()
-                win.border()
+                self._draw_ascii_modal_border(win)
                 win.addstr(0, 2, f" {title} ", curses.A_BOLD)
                 win.addstr(modal_h - 2, 2, "Tab/Shift+Tab: field  F2: save  F10/Esc/q: cancel")
 
@@ -1147,6 +1159,99 @@ class TUIEmail:
             lines.append(current)
         return lines or [""]
 
+    def _wrap_body_for_width(self, body, width):
+        lines = (body or "").splitlines()
+        wrapped_body_lines = []
+        wrap_width = max(1, width)
+        for raw_line in lines:
+            if raw_line == "":
+                wrapped_body_lines.append("")
+                continue
+            wrapped = textwrap.wrap(
+                raw_line,
+                width=wrap_width,
+                replace_whitespace=False,
+                drop_whitespace=False,
+                break_long_words=True,
+                break_on_hyphens=False,
+            )
+            wrapped_body_lines.extend(wrapped or [""])
+        return wrapped_body_lines or [""]
+
+    def view_message_modal(self, msg):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(h - 2, 30)
+        modal_w = min(w - 4, 110)
+        if modal_h < 12 or modal_w < 50:
+            self.status = "Terminal too small for message modal"
+            return
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        body_width = modal_w - 4
+        wrapped_body = self._wrap_body_for_width(msg.body or "", body_width)
+        body_top = 6
+        body_h = modal_h - body_top - 2
+        scroll = 0
+
+        wheel_up_mask = (
+            getattr(curses, "BUTTON4_PRESSED", 0)
+            | getattr(curses, "BUTTON4_RELEASED", 0)
+            | getattr(curses, "BUTTON4_CLICKED", 0)
+        )
+        wheel_down_mask = (
+            getattr(curses, "BUTTON5_PRESSED", 0)
+            | getattr(curses, "BUTTON5_RELEASED", 0)
+            | getattr(curses, "BUTTON5_CLICKED", 0)
+        )
+
+        while True:
+            max_scroll = max(0, len(wrapped_body) - body_h)
+            scroll = max(0, min(scroll, max_scroll))
+
+            win.erase()
+            self._draw_ascii_modal_border(win)
+            win.addstr(0, 2, " Email View ", curses.A_BOLD)
+            win.addstr(1, 2, f"Subject: {msg.subject}"[: modal_w - 4])
+            win.addstr(2, 2, f"From: {msg.from_addr}"[: modal_w - 4])
+            win.addstr(3, 2, f"To: {msg.to_addr}"[: modal_w - 4])
+            win.addstr(4, 2, f"Date: {msg.date}"[: modal_w - 4])
+
+            for idx, line in enumerate(wrapped_body[scroll : scroll + body_h]):
+                win.addstr(body_top + idx, 2, line[:body_width].ljust(body_width))
+
+            hint = "Up/Down/PgUp/PgDn/mouse wheel scroll  Space/Esc/q close"
+            win.addstr(modal_h - 1, 2, hint[: modal_w - 4])
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("q"), ord("Q"), 27, ord(" ")):
+                return
+            if key in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                scroll = min(max_scroll, scroll + 1)
+            elif key == curses.KEY_PPAGE:
+                scroll = max(0, scroll - body_h)
+            elif key == curses.KEY_NPAGE:
+                scroll = min(max_scroll, scroll + body_h)
+            elif key == curses.KEY_HOME:
+                scroll = 0
+            elif key == curses.KEY_END:
+                scroll = max_scroll
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, _, _, _, bstate = curses.getmouse()
+                    if bstate & wheel_up_mask:
+                        scroll = max(0, scroll - 3)
+                    elif bstate & wheel_down_mask:
+                        scroll = min(max_scroll, scroll + 3)
+                except curses.error:
+                    pass
+
     def _draw(self):
         self.stdscr.clear()
         h, w = self.stdscr.getmaxyx()
@@ -1166,6 +1271,7 @@ class TUIEmail:
 
         shortcut_items = [
             "q:Quit",
+            "Space:View",
             "c:Compose",
             "R:Reply",
             "W:Forward",
@@ -1230,22 +1336,7 @@ class TUIEmail:
                 self.stdscr.addstr(yoff + 9 + idx, detail_x, thread_line[:detail_w])
 
             body_start = yoff + 10 + thread_rows
-            body_lines = selected.body.splitlines()
-            wrapped_body_lines = []
-            wrap_width = max(1, detail_w)
-            for raw_line in body_lines:
-                if raw_line == "":
-                    wrapped_body_lines.append("")
-                    continue
-                wrapped = textwrap.wrap(
-                    raw_line,
-                    width=wrap_width,
-                    replace_whitespace=False,
-                    drop_whitespace=False,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                )
-                wrapped_body_lines.extend(wrapped or [""])
+            wrapped_body_lines = self._wrap_body_for_width(selected.body, detail_w)
             max_body_rows = max(0, content_bottom - body_start + 1)
             for idx, line in enumerate(wrapped_body_lines[:max_body_rows]):
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
@@ -1260,6 +1351,10 @@ class TUIEmail:
 
     def run(self):
         curses.curs_set(0)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
@@ -1282,6 +1377,9 @@ class TUIEmail:
                 self.message_index = max(0, self.message_index - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
                 self.message_index = min(len(self.conversations) - 1, self.message_index + 1)
+            elif key == ord(" ") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                self.view_message_modal(selected)
             elif key == ord("f"):
                 self.fetch_current_folder()
             elif key == ord("F"):
