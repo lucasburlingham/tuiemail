@@ -22,7 +22,7 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
     - In compose modal: `To`, `Cc`, `Bcc`, `Subject`, `Body` fields
     - `Tab`/`Shift+Tab` switch fields, arrow keys move cursor, `F2` saves draft, `F10`/`Esc`/`q` cancel
   - `Space`: Open selected email in scrollable modal viewer
-    - In message modal: `r` reply, `a` reply all, `f` forward
+    - In message modal: `r` reply, `a` reply all, `f` forward, `t` listen (offline TTS)
     - `Up`/`Down`, `PgUp`/`PgDn`, `Home`/`End`, and mouse wheel scroll
   - In Settings modal: `F2` saves config, `F5` resets (deletes local DB + config, then re-setup)
   - Sending with `s` shows a confirmation dialog (`y`/`n`) before sending
@@ -79,6 +79,16 @@ Or use the helper script:
 sh build-pyinstaller.sh
 ```
 
+Or use Make targets:
+
+```bash
+make release
+make install
+```
+
+`make install` builds and installs the binary to `/usr/local/bin/tuiemail` by default.
+If needed, run with `sudo` for permissions, or set a custom prefix (for example, `make install PREFIX=$HOME/.local`).
+
 The generated binary is written to:
 
 ```bash
@@ -109,10 +119,52 @@ Notes:
 - Delete now attempts remote removal, auto-refreshes the source folder, and reports verified server outcome in the status line.
 - Multipart messages prefer `text/plain`; HTML-only messages are converted to terminal-safe text.
 
+## Offline TTS support
+
+The client supports offline text-to-speech for the currently selected message with:
+
+- `t` in the main view (for selected conversation latest message)
+- `t` in the message modal
+
+Supported engines (auto-detected, preferred order):
+
+- `piper` (preferred; CLI must be installed and a voice model configured)
+- `espeak`
+- `pico2wave` + `aplay`
+- `say` (macOS fallback)
+
+If no engine is present, the status line shows a warning.
+
+## Piper voice setup
+
+The app downloads a default model to `~/.tui_email/piper_voices`
+if missing:
+
+- `en_US-lessac-medium.onnx`
+- `en_US-lessac-medium.onnx.json`
+
+from:
+
+- https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+- https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+
+To override existing paths, set config section in `~/.tui_email/config.json`:
+
+```json
+{
+  "piper": {
+    "model_path": "/path/to/en_US-lessac-medium.onnx",
+    "config_path": "/path/to/en_US-lessac-medium.onnx.json"
+  }
+}
+```
+
 ## Dependencies
 
 - Python 3.8+
 - `curses` (std lib; on Linux built-in)
+- `piper` (recommended for best quality, optionally install from https://github.com/rhasspy/piper)
+
 
 ## Troubleshooting
 

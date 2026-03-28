@@ -8,7 +8,12 @@ import ssl
 import email
 import html
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import textwrap
+import os
 from html.parser import HTMLParser
 from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
@@ -20,6 +25,11 @@ DB_PATH = BASE_DIR / "messages.db"
 CONFIG_PATH = BASE_DIR / "config.json"
 FOLDERS_DEFAULT = ["Inbox", "Sent", "Drafts", "Archive", "Flagged", "Spam", "Trash"]
 FETCH_LIMIT = 30
+
+PIPER_VOICE_DIR = BASE_DIR / "piper_voices"
+PIPER_DEFAULT_VOICE = "en_US-lessac-medium"
+PIPER_DEFAULT_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
+PIPER_DEFAULT_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
 
 class Message:
     def __init__(
@@ -84,6 +94,43 @@ def normalize_subject(subject):
     return re.sub(r"^(?:\s*(?:re|fw|fwd)\s*:\s*)+", "", text, flags=re.IGNORECASE).strip().lower() or "(no subject)"
 
 
+def _download_file(url, path):
+    try:
+        PIPER_VOICE_DIR.mkdir(mode=0o700, exist_ok=True)
+        from urllib.request import urlopen
+
+        with urlopen(url) as response:
+            with open(path, "wb") as out_file:
+                out_file.write(response.read())
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_piper_voice(model_path=None, config_path=None):
+    PIPER_VOICE_DIR.mkdir(mode=0o700, exist_ok=True)
+
+    if model_path:
+        model_path = Path(model_path)
+    else:
+        model_path = PIPER_VOICE_DIR / f"{PIPER_DEFAULT_VOICE}.onnx"
+
+    if config_path:
+        config_path = Path(config_path)
+    else:
+        config_path = PIPER_VOICE_DIR / f"{PIPER_DEFAULT_VOICE}.onnx.json"
+
+    if not model_path.exists():
+        if not _download_file(PIPER_DEFAULT_MODEL_URL, model_path):
+            return None, None
+
+    if not config_path.exists():
+        if not _download_file(PIPER_DEFAULT_CONFIG_URL, config_path):
+            return None, None
+
+    return str(model_path), str(config_path)
+
+
 def build_conversations(messages):
     groups = {}
     ordered_keys = []
@@ -104,6 +151,30 @@ def build_conversations(messages):
 
 def ensure_data_dir():
     BASE_DIR.mkdir(mode=0o700, exist_ok=True)
+
+
+def _jobs_dir():
+    ensure_data_dir()
+    path = BASE_DIR / "jobs"
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def _job_results_dir():
+    ensure_data_dir()
+    path = BASE_DIR / "job_results"
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def _write_job_result(job_stem, message, touched_folders=None):
+    result = {
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+        "message": message,
+        "touched_folders": touched_folders or [],
+    }
+    result_path = _job_results_dir() / f"{job_stem}.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
 
 
 def load_config():
@@ -615,6 +686,218 @@ def remote_delete_message(cfg, folder, remote_uid):
         return False
 
 
+def _run_delete_job(job_file):
+    job_path = Path(job_file)
+    try:
+        payload = json.loads(job_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    source_folder = payload.get("source_folder")
+    message_ids = [m for m in payload.get("message_ids", []) if isinstance(m, int)]
+    if not source_folder or not message_ids:
+        return
+
+    cfg = load_config()
+    id_set = set(message_ids)
+    all_messages = load_messages()
+    target_msgs = [m for m in all_messages if m.id in id_set]
+    if not target_msgs:
+        return
+
+    attempted = 0
+    cmd_ok = 0
+    unverifiable = 0
+    cmd_ok_by_msg_id = {}
+    keys_by_msg_id = {}
+
+    for msg in target_msgs:
+        key = message_sync_key(msg)
+        keys_by_msg_id[msg.id] = key
+        if key is None:
+            cmd_ok_by_msg_id[msg.id] = False
+            unverifiable += 1
+            continue
+
+        attempted += 1
+        ok = remote_delete_message(cfg, msg.folder, msg.remote_uid)
+        cmd_ok_by_msg_id[msg.id] = ok
+        if ok:
+            cmd_ok += 1
+
+    result_message = "Delete worker finished"
+
+    remote_after = fetch_imap_messages(cfg, source_folder, fetch_limit=0)
+    if remote_after is None:
+        # If verification fetch fails, keep command-level result as best effort.
+        for msg in target_msgs:
+            key = keys_by_msg_id.get(msg.id)
+            if key is None or cmd_ok_by_msg_id.get(msg.id, False):
+                msg.folder = "Trash"
+            else:
+                msg.folder = source_folder
+            save_message(msg)
+        result_message = (
+            f"Delete done: cmd-ok {cmd_ok}/{attempted}, "
+            f"local-only {unverifiable}, verify refresh failed"
+        )
+        _write_job_result(job_path.stem, result_message, touched_folders=[source_folder, "Trash"])
+        return
+
+    remote_keys = {message_sync_key(m) for m in remote_after if message_sync_key(m) is not None}
+    verified_deleted = 0
+    still_on_server = 0
+    for msg in target_msgs:
+        key = keys_by_msg_id.get(msg.id)
+        if key is None:
+            msg.folder = "Trash"
+        elif key in remote_keys:
+            still_on_server += 1
+            msg.folder = source_folder
+        else:
+            verified_deleted += 1
+            msg.folder = "Trash"
+        save_message(msg)
+
+    result_message = (
+        f"Delete done: verified {verified_deleted}/{attempted}, "
+        f"still {still_on_server}, local-only {unverifiable}"
+    )
+    _write_job_result(job_path.stem, result_message, touched_folders=[source_folder, "Trash"])
+
+
+def _run_fetch_job(job_file):
+    job_path = Path(job_file)
+    try:
+        payload = json.loads(job_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    cfg = load_config()
+    fetch_limit = int(payload.get("fetch_limit", FETCH_LIMIT))
+    mode = str(payload.get("mode", "current"))
+
+    if mode == "current":
+        folder = str(payload.get("folder", "")).strip()
+        if not folder:
+            return
+        msgs = fetch_imap_messages(cfg, folder, fetch_limit=fetch_limit)
+        if msgs is None:
+            _write_job_result(job_path.stem, f"Fetch failed for '{folder}'", touched_folders=[])
+            return
+        result = apply_folder_diff(folder, msgs)
+        _write_job_result(
+            job_path.stem,
+            f"{folder}: +{result['inserted']} ~{result['updated']} -{result['deleted']} (remote {result['remote_total']})",
+            touched_folders=[folder],
+        )
+        return
+
+    if mode == "all":
+        folders = [str(f) for f in payload.get("folders", []) if str(f).strip()]
+        if not folders:
+            return
+
+        inserted = 0
+        updated = 0
+        deleted = 0
+        failed = 0
+        touched = []
+        for folder in folders:
+            msgs = fetch_imap_messages(cfg, folder, fetch_limit=0)
+            if msgs is None:
+                failed += 1
+                continue
+            result = apply_folder_diff(folder, msgs)
+            touched.append(folder)
+            inserted += result["inserted"]
+            updated += result["updated"]
+            deleted += result["deleted"]
+
+        _write_job_result(
+            job_path.stem,
+            f"All folders: +{inserted} ~{updated} -{deleted} ({len(folders)-failed}/{len(folders)} folders)",
+            touched_folders=touched,
+        )
+
+
+def start_background_fetch_job(mode, folder=None, folders=None, fetch_limit=FETCH_LIMIT):
+    jobs_dir = _jobs_dir()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    job_file = jobs_dir / f"fetch-{stamp}.json"
+
+    payload = {"mode": mode, "fetch_limit": int(fetch_limit)}
+    if folder is not None:
+        payload["folder"] = folder
+    if folders is not None:
+        payload["folders"] = list(folders)
+
+    try:
+        job_file.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as exc:
+        return False, f"Could not write fetch job: {exc}"
+
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--fetch-job", str(job_file)]
+        else:
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--fetch-job", str(job_file)]
+
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        return True, "queued"
+    except Exception as exc:
+        try:
+            job_file.unlink()
+        except Exception:
+            pass
+        return False, f"Could not start fetch worker: {exc}"
+
+
+def start_background_delete_job(source_folder, message_ids):
+    ids = [m for m in message_ids if isinstance(m, int)]
+    if not ids:
+        return False, "No message IDs to delete"
+
+    jobs_dir = _jobs_dir()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    job_file = jobs_dir / f"delete-{stamp}.json"
+    payload = {"source_folder": source_folder, "message_ids": ids}
+
+    try:
+        job_file.write_text(json.dumps(payload), encoding="utf-8")
+    except Exception as exc:
+        return False, f"Could not write delete job: {exc}"
+
+    try:
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--delete-job", str(job_file)]
+        else:
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--delete-job", str(job_file)]
+
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=True,
+        )
+        return True, "queued"
+    except Exception as exc:
+        try:
+            job_file.unlink()
+        except Exception:
+            pass
+        return False, f"Could not start delete worker: {exc}"
+
+
 def _guess_smtp_host(imap_host):
     if not imap_host:
         return ""
@@ -723,6 +1006,8 @@ class TUIEmail:
         self.detail_body_rect = None
         self.messages = []
         self.conversations = []
+        self._current_tts_proc = None
+        self._current_tts_tmp_path = None
 
         init_db()
         source_folders = load_folders()
@@ -745,6 +1030,52 @@ class TUIEmail:
         self.last_fetch = {}
         self.messages = load_messages(self.current_folder())
         self.conversations = build_conversations(self.messages)
+        self.pending_delete_jobs = 0
+        self.pending_fetch_jobs = 0
+        self._refresh_background_feedback()
+
+    def _refresh_background_feedback(self):
+        try:
+            jobs_dir = _jobs_dir()
+            self.pending_delete_jobs = sum(1 for _ in jobs_dir.glob("delete-*.json"))
+            self.pending_fetch_jobs = sum(1 for _ in jobs_dir.glob("fetch-*.json"))
+        except Exception:
+            self.pending_delete_jobs = 0
+            self.pending_fetch_jobs = 0
+
+        try:
+            results_dir = _job_results_dir()
+            result_files = sorted(results_dir.glob("*.json"), key=lambda p: p.stat().st_mtime)
+            latest_message = None
+            touched_folders = set()
+            for result_file in result_files:
+                try:
+                    payload = json.loads(result_file.read_text(encoding="utf-8"))
+                    msg = str(payload.get("message", "")).strip()
+                    if msg:
+                        latest_message = msg
+                    for folder in payload.get("touched_folders", []):
+                        if isinstance(folder, str) and folder.strip():
+                            touched_folders.add(folder)
+                except Exception:
+                    pass
+                try:
+                    result_file.unlink()
+                except Exception:
+                    pass
+
+            if touched_folders:
+                now = datetime.now()
+                for folder in touched_folders:
+                    self.last_fetch[folder] = now
+                self.messages = load_messages(self.current_folder())
+                self.conversations = build_conversations(self.messages)
+                self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+
+            if latest_message:
+                self.status = latest_message
+        except Exception:
+            pass
 
     def _insert_char(self, text, cursor, ch):
         return text[:cursor] + ch + text[cursor:], cursor + 1
@@ -1365,44 +1696,26 @@ class TUIEmail:
 
     def fetch_current_folder(self):
         folder = self.current_folder()
-        self.status = f"Fetching {folder}..."
-        msgs = fetch_imap_messages(self.config, folder, fetch_limit=self.fetch_limit)
-        if msgs is None:
-            self.status = f"Fetch failed for '{folder}'"
-            return
-        result = apply_folder_diff(folder, msgs)
-        self.messages = load_messages(folder)
-        self.conversations = build_conversations(self.messages)
-        self.message_index = 0
-        self.last_fetch[folder] = datetime.now()
-        self.status = (
-            f"{folder}: +{result['inserted']} ~{result['updated']} -{result['deleted']} "
-            f"(remote {result['remote_total']})"
+        ok, detail = start_background_fetch_job(
+            mode="current",
+            folder=folder,
+            fetch_limit=self.fetch_limit,
         )
+        if not ok:
+            self.status = f"Fetch queue failed: {detail}"
+            return
+        self.status = f"Fetching {folder} in background..."
 
     def fetch_all_folders(self):
-        self.status = "Fetching all folders..."
-        inserted = 0
-        updated = 0
-        deleted = 0
-        failed = 0
-        for folder in self.folders:
-            msgs = fetch_imap_messages(self.config, folder, fetch_limit=0)
-            if msgs is None:
-                failed += 1
-                continue
-            result = apply_folder_diff(folder, msgs)
-            self.last_fetch[folder] = datetime.now()
-            inserted += result["inserted"]
-            updated += result["updated"]
-            deleted += result["deleted"]
-        self.messages = load_messages(self.current_folder())
-        self.conversations = build_conversations(self.messages)
-        self.message_index = 0
-        self.status = (
-            f"All folders: +{inserted} ~{updated} -{deleted} "
-            f"({len(self.folders)-failed}/{len(self.folders)} folders)"
+        ok, detail = start_background_fetch_job(
+            mode="all",
+            folders=self.folders,
+            fetch_limit=0,
         )
+        if not ok:
+            self.status = f"Fetch-all queue failed: {detail}"
+            return
+        self.status = "Fetching all folders in background..."
 
     def delete_selected_conversation_verified(self):
         if not self.conversations:
@@ -1412,79 +1725,23 @@ class TUIEmail:
         selected_convo = self.conversations[self.message_index]
         source_folder = self.current_folder()
         target_msgs = list(selected_convo.messages)
+        message_ids = [msg.id for msg in target_msgs if msg.id is not None]
 
-        attempted = 0
-        cmd_ok = 0
-        unverifiable = 0
-
-        keys_by_msg_id = {}
-        cmd_ok_by_msg_id = {}
-        for msg in target_msgs:
-            key = message_sync_key(msg)
-            keys_by_msg_id[msg.id] = key
-            if key is None:
-                cmd_ok_by_msg_id[msg.id] = False
-                unverifiable += 1
-                continue
-            attempted += 1
-            ok = remote_delete_message(self.config, msg.folder, msg.remote_uid)
-            cmd_ok_by_msg_id[msg.id] = ok
-            if ok:
-                cmd_ok += 1
-
-        # Auto-refresh source folder to verify actual server state.
-        remote_after = fetch_imap_messages(self.config, source_folder, fetch_limit=0)
-        if remote_after is None:
-            # Fall back to command-level result when verification fetch fails.
-            for msg in target_msgs:
-                key = keys_by_msg_id.get(msg.id)
-                if key is None:
-                    msg.folder = "Trash"
-                    save_message(msg)
-                    continue
-                if cmd_ok_by_msg_id.get(msg.id, False):
-                    msg.folder = "Trash"
-                else:
-                    msg.folder = source_folder
-                save_message(msg)
-            self.messages = load_messages(self.current_folder())
-            self.conversations = build_conversations(self.messages)
-            self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
-            self.detail_scroll = 0
-            self.status = (
-                f"Delete pending verify: cmd-ok {cmd_ok}/{attempted}, "
-                f"unverifiable {unverifiable} (refresh failed)"
-            )
+        ok, detail = start_background_delete_job(source_folder, message_ids)
+        if not ok:
+            self.status = f"Delete queue failed: {detail}"
             return
 
-        remote_keys = {message_sync_key(m) for m in remote_after if message_sync_key(m) is not None}
-
-        verified_deleted = 0
-        still_on_server = 0
+        # Optimistically move to Trash now; background worker reconciles with server state.
         for msg in target_msgs:
-            key = keys_by_msg_id.get(msg.id)
-            if key is None:
-                msg.folder = "Trash"
-                save_message(msg)
-                continue
-
-            if key in remote_keys:
-                still_on_server += 1
-                msg.folder = source_folder
-            else:
-                verified_deleted += 1
-                msg.folder = "Trash"
+            msg.folder = "Trash"
             save_message(msg)
 
         self.messages = load_messages(self.current_folder())
         self.conversations = build_conversations(self.messages)
         self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
         self.detail_scroll = 0
-        total = len(target_msgs)
-        self.status = (
-            f"Delete verified {verified_deleted}/{attempted} server, "
-            f"still {still_on_server}, local-only {unverifiable}, total {total}"
-        )
+        self.status = f"Delete queued in background ({len(message_ids)} messages)"
 
     def _wrap_shortcuts(self, items, max_width):
         if max_width <= 0:
@@ -1544,6 +1801,143 @@ class TUIEmail:
             wrapped_body_lines.extend(wrapped or [""])
         return wrapped_body_lines or [""]
 
+    def _stop_tts(self):
+        proc = getattr(self, "_current_tts_proc", None)
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=3)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._current_tts_proc = None
+
+        tmp_path = getattr(self, "_current_tts_tmp_path", None)
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._current_tts_tmp_path = None
+
+    def _speak_text_offline(self, text):
+        if not text:
+            return False, "No text to speak"
+        text = (text or "").strip()
+        if not text:
+            return False, "No text after trimming"
+
+        # Stop any currently running TTS to avoid duplicates
+        self._stop_tts()
+
+        # Prefer Piper TTS when available
+        if shutil.which("piper"):
+            model_path = None
+            config_path = None
+            piper_cfg = self.config.get("piper") if isinstance(self.config.get("piper"), dict) else {}
+            if piper_cfg:
+                model_path = piper_cfg.get("model_path")
+                config_path = piper_cfg.get("config_path")
+
+            model_path, config_path = _ensure_piper_voice(model_path=model_path, config_path=config_path)
+            if model_path and config_path:
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp_path = tmp.name
+
+                    cmd = ["piper", "-m", model_path, "-c", config_path, "-i", "/tmp/piper-tts-input.txt", "-f", tmp_path]
+                    # write text to input file (to support spaces/newlines safely)
+                    with open("/tmp/piper-tts-input.txt", "w", encoding="utf-8") as f:
+                        f.write(text)
+
+                    subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                    player_cmd = None
+                    if shutil.which("aplay"):
+                        player_cmd = ["aplay", tmp_path]
+                    elif shutil.which("ffplay"):
+                        player_cmd = ["ffplay", "-nodisp", "-autoexit", tmp_path]
+                    elif shutil.which("play"):
+                        player_cmd = ["play", tmp_path]
+
+                    if player_cmd is None:
+                        try:
+                            Path(tmp_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return False, "Piper TTS generated audio, but no playback utility found"
+
+                    proc = subprocess.Popen(player_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    self._current_tts_proc = proc
+                    self._current_tts_tmp_path = tmp_path
+                    return True, "Reading with Piper TTS"
+                except Exception:
+                    try:
+                        if tmp_path:
+                            Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    # If piper fails at runtime, fall back.
+                    pass
+
+        # Fallback drivers
+        if shutil.which("espeak"):
+            # Use espeak directly; it is typically offline and available via package manager.
+            try:
+                # Run asynchronously to keep UI responsive.
+                proc = subprocess.Popen(["espeak", "-v", "en", text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._current_tts_proc = proc
+                self._current_tts_tmp_path = None
+                return True, "Reading with espeak"
+            except Exception as exc:
+                return False, f"espeak failed: {exc}"
+
+        if shutil.which("pico2wave") and shutil.which("aplay"):
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp_path = tmp.name
+                subprocess.run(["pico2wave", "-w", tmp_path, text], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                proc = subprocess.Popen(["aplay", tmp_path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._current_tts_proc = proc
+                self._current_tts_tmp_path = tmp_path
+                return True, "Reading with pico2wave/aplay"
+            except Exception as exc:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return False, f"pico2wave/aplay failed: {exc}"
+
+        if shutil.which("say"):
+            try:
+                proc = subprocess.Popen(["say", text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._current_tts_proc = proc
+                self._current_tts_tmp_path = None
+                return True, "Reading with say"
+            except Exception as exc:
+                return False, f"say failed: {exc}"
+
+        return False, "No offline TTS engine found; install espeak or pico2wave"
+
+    def _read_message_aloud(self, msg):
+        if not msg:
+            return False, "No message selected"
+        snippet = []
+        snippet.append(f"Subject: {msg.subject or '(No Subject)'}")
+        snippet.append(f"From: {msg.from_addr or '(Unknown)'}")
+        body = (msg.body or "").replace("\n", " ")
+        if body:
+            snippet.append(body[:400])  # limit spoken length
+        text = ". ".join(snippet)
+        return self._speak_text_offline(text)
+
     def view_message_modal(self, msg):
         h, w = self.stdscr.getmaxyx()
         modal_h = min(h - 2, 30)
@@ -1589,7 +1983,7 @@ class TUIEmail:
             for idx, line in enumerate(wrapped_body[scroll : scroll + body_h]):
                 win.addstr(body_top + idx, 2, line[:body_width].ljust(body_width))
 
-            hint = "r:reply  a:reply-all  f:forward  Up/Down/PgUp/PgDn/wheel scroll  Space/Esc/q close"
+            hint = "r:reply  a:reply-all  f:forward  t:listen  Up/Down/PgUp/PgDn/wheel scroll  Space/Esc/q close"
             win.addstr(modal_h - 1, 2, hint[: modal_w - 4])
             win.refresh()
 
@@ -1629,6 +2023,10 @@ class TUIEmail:
                     initial_body=seed["body"],
                 )
                 return
+            if key in (ord("t"), ord("T")):
+                ok, msg_text = self._read_message_aloud(msg)
+                self.status = msg_text if ok else f"TTS failed: {msg_text}"
+                continue
             if key in (curses.KEY_UP, ord("k")):
                 scroll = max(0, scroll - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
@@ -1676,6 +2074,7 @@ class TUIEmail:
             "R:Reply",
             "W:Forward",
             "s:SendDraft",
+            "t:Listen",
             "f:Fetch",
             "F:FetchAll",
             "←/→ Folder",
@@ -1750,6 +2149,10 @@ class TUIEmail:
                 self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
 
         status_text = f"Status: {self.status}"
+        if self.pending_delete_jobs > 0:
+            status_text += f" | bg-delete pending: {self.pending_delete_jobs}"
+        if self.pending_fetch_jobs > 0:
+            status_text += f" | bg-fetch pending: {self.pending_fetch_jobs}"
         self.stdscr.addstr(footer_top, 0, " " * (w - 1), self.status_attr)
         self.stdscr.addstr(footer_top, 1, status_text[: max(0, w - 3)], self.status_attr)
         for i, line in enumerate(shortcut_lines):
@@ -1771,22 +2174,28 @@ class TUIEmail:
             self.status_attr = curses.color_pair(1) | curses.A_BOLD
             self.header_attr = curses.color_pair(2) | curses.A_BOLD
         while True:
+            self._refresh_background_feedback()
             self._draw()
             key = self.stdscr.getch()
             if key == ord("q"):
+                self._stop_tts()
                 break
             elif key in (curses.KEY_LEFT, ord("h")):
+                self._stop_tts()
                 self.folder_index = max(0, self.folder_index - 1)
                 self.message_index = 0
                 self.detail_scroll = 0
             elif key in (curses.KEY_RIGHT, ord("l")):
+                self._stop_tts()
                 self.folder_index = min(len(self.folders) - 1, self.folder_index + 1)
                 self.message_index = 0
                 self.detail_scroll = 0
             elif key in (curses.KEY_UP, ord("k")):
+                self._stop_tts()
                 self.message_index = max(0, self.message_index - 1)
                 self.detail_scroll = 0
             elif key in (curses.KEY_DOWN, ord("j")):
+                self._stop_tts()
                 self.message_index = min(len(self.conversations) - 1, self.message_index + 1)
                 self.detail_scroll = 0
             elif key in (curses.KEY_PPAGE, ord("[")) and self.conversations:
@@ -1827,6 +2236,10 @@ class TUIEmail:
                 self.fetch_current_folder()
             elif key == ord("F"):
                 self.fetch_all_folders()
+            elif key in (ord("t"), ord("T")) and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                ok, msg_text = self._read_message_aloud(selected)
+                self.status = msg_text if ok else f"TTS failed: {msg_text}"
             elif key == ord("d") and self.conversations:
                 self.delete_selected_conversation_verified()
             elif key == ord("r") and self.conversations:
@@ -1895,6 +2308,24 @@ def main(stdscr):
 
 
 def cli():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--delete-job":
+        try:
+            _run_delete_job(sys.argv[2])
+        finally:
+            try:
+                Path(sys.argv[2]).unlink()
+            except Exception:
+                pass
+        return
+    if len(sys.argv) >= 3 and sys.argv[1] == "--fetch-job":
+        try:
+            _run_fetch_job(sys.argv[2])
+        finally:
+            try:
+                Path(sys.argv[2]).unlink()
+            except Exception:
+                pass
+        return
     curses.wrapper(main)
 
 
