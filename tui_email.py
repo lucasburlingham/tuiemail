@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-import curses
+try:
+    import curses
+except ImportError:
+    curses = None
+
 import json
 import sqlite3
 import imaplib
@@ -20,7 +24,10 @@ from email.utils import parseaddr, getaddresses
 from pathlib import Path
 from datetime import datetime
 
-BASE_DIR = Path.home() / ".tui_email"
+if os.name == "nt":
+    BASE_DIR = Path(os.getenv("APPDATA", Path.home() / "AppData" / "Roaming")) / "tui_email"
+else:
+    BASE_DIR = Path.home() / ".tui_email"
 DB_PATH = BASE_DIR / "messages.db"
 CONFIG_PATH = BASE_DIR / "config.json"
 FOLDERS_DEFAULT = ["Inbox", "Sent", "Drafts", "Archive", "Flagged", "Spam", "Trash"]
@@ -28,6 +35,7 @@ FETCH_LIMIT = 30
 
 PIPER_VOICE_DIR = BASE_DIR / "piper_voices"
 PIPER_DEFAULT_VOICE = "en_US-lessac-medium"
+PIPER_VOICES_JSON_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json"
 PIPER_DEFAULT_MODEL_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx"
 PIPER_DEFAULT_CONFIG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json"
 
@@ -107,6 +115,48 @@ def _download_file(url, path):
         return False
 
 
+def _load_piper_voices():
+    PIPER_VOICE_DIR.mkdir(mode=0o700, exist_ok=True)
+    cache_path = PIPER_VOICE_DIR / "voices.json"
+    voices = []
+    try:
+        if cache_path.exists():
+            voices = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not voices:
+            from urllib.request import urlopen
+
+            with urlopen(PIPER_VOICES_JSON_URL) as response:
+                voices_map = json.loads(response.read().decode("utf-8"))
+            if isinstance(voices_map, dict):
+                voices = sorted(voices_map.keys())
+            elif isinstance(voices_map, list):
+                voices = sorted(voices_map)
+            if voices:
+                cache_path.write_text(json.dumps(voices), encoding="utf-8")
+    except Exception:
+        pass
+    return voices
+
+
+def _voice_urls_for(voice):
+    # voice string format: en_US-lessac-medium
+    parts = voice.split("-")
+    if len(parts) < 3:
+        return None, None
+    locale = parts[0]
+    voice_name = parts[1]
+    quality = parts[2]
+    lang = locale.split("_")[0].lower()
+
+    model_url = (
+        f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{lang}/{locale}/{voice_name}/{quality}/{voice}.onnx"
+    )
+    config_url = (
+        f"https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/{lang}/{locale}/{voice_name}/{quality}/{voice}.onnx.json"
+    )
+    return model_url, config_url
+
+
 def _ensure_piper_voice(model_path=None, config_path=None):
     PIPER_VOICE_DIR.mkdir(mode=0o700, exist_ok=True)
 
@@ -120,13 +170,23 @@ def _ensure_piper_voice(model_path=None, config_path=None):
     else:
         config_path = PIPER_VOICE_DIR / f"{PIPER_DEFAULT_VOICE}.onnx.json"
 
-    if not model_path.exists():
-        if not _download_file(PIPER_DEFAULT_MODEL_URL, model_path):
-            return None, None
+    if not model_path.exists() or not config_path.exists():
+        voice = load_config().get("piper", {}).get("voice", PIPER_DEFAULT_VOICE)
+        inferred_model_url, inferred_config_url = _voice_urls_for(voice)
 
-    if not config_path.exists():
-        if not _download_file(PIPER_DEFAULT_CONFIG_URL, config_path):
-            return None, None
+        if not model_path.exists():
+            if inferred_model_url:
+                if not _download_file(inferred_model_url, model_path):
+                    # fallback to default model URL once
+                    _download_file(PIPER_DEFAULT_MODEL_URL, model_path)
+
+        if not config_path.exists():
+            if inferred_config_url:
+                if not _download_file(inferred_config_url, config_path):
+                    _download_file(PIPER_DEFAULT_CONFIG_URL, config_path)
+
+    if not model_path.exists() or not config_path.exists():
+        return None, None
 
     return str(model_path), str(config_path)
 
@@ -1286,6 +1346,58 @@ class TUIEmail:
         h, w = self.stdscr.getmaxyx()
         modal_h = min(10, h - 2)
         modal_w = min(80, w - 4)
+
+    def _piper_voice_selection_modal(self, current_voice, options):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(14, h - 4)
+        modal_w = min(60, w - 8)
+        if modal_h < 8 or modal_w < 30:
+            return current_voice
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        selected_idx = 0
+        if current_voice in options:
+            selected_idx = options.index(current_voice)
+
+        while True:
+            win.erase()
+            self._draw_ascii_modal_border(win)
+            win.addstr(0, 2, " Select Piper Voice ", curses.A_BOLD)
+            win.addstr(1, 2, "Enter to select, Esc/q to cancel")
+
+            list_h = modal_h - 4
+            top = max(0, min(selected_idx - list_h + 1, selected_idx))
+            for i in range(list_h):
+                idx = top + i
+                if idx >= len(options):
+                    break
+                attr = curses.A_REVERSE if idx == selected_idx else curses.A_NORMAL
+                voice = options[idx]
+                win.addstr(2 + i, 2, voice[: modal_w - 4].ljust(modal_w - 4), attr)
+
+            win.refresh()
+            key = win.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return current_voice
+            if key in (10, 13, curses.KEY_ENTER):
+                return options[selected_idx]
+            if key in (curses.KEY_UP, ord("k")):
+                selected_idx = max(0, selected_idx - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                selected_idx = min(len(options) - 1, selected_idx + 1)
+            elif key in (curses.KEY_PPAGE,):
+                selected_idx = max(0, selected_idx - list_h)
+            elif key in (curses.KEY_NPAGE,):
+                selected_idx = min(len(options) - 1, selected_idx + list_h)
+
+    def _confirm_reset_modal(self):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(10, h - 2)
+        modal_w = min(80, w - 4)
         if modal_h < 8 or modal_w < 50:
             return False
 
@@ -1346,6 +1458,8 @@ class TUIEmail:
         win = curses.newwin(modal_h, modal_w, start_y, start_x)
         win.keypad(True)
 
+        piper_voice_options = _load_piper_voices()
+
         fields = [
             {"key": "imap_host", "label": "IMAP Host", "type": "text", "secret": False},
             {"key": "imap_port", "label": "IMAP Port", "type": "int", "secret": False},
@@ -1358,6 +1472,9 @@ class TUIEmail:
             {"key": "smtp_starttls", "label": "SMTP STARTTLS", "type": "bool", "secret": False},
             {"key": "smtp_user", "label": "SMTP User", "type": "text", "secret": False},
             {"key": "smtp_pass", "label": "SMTP Pass", "type": "text", "secret": True},
+            {"key": "piper_voice", "label": "Piper Voice", "type": "text", "secret": False},
+            {"key": "piper_model_path", "label": "Piper Model Path", "type": "text", "secret": False},
+            {"key": "piper_config_path", "label": "Piper Config Path", "type": "text", "secret": False},
             {"key": "fetch_limit", "label": "Fetch Limit", "type": "int", "secret": False},
             {"key": "__reset__", "label": "Reset DB + Config", "type": "action", "secret": False},
         ]
@@ -1378,7 +1495,12 @@ class TUIEmail:
             if field["type"] == "bool":
                 values[key] = bool(self.config.get(key, key in ("imap_ssl", "smtp_starttls")))
             else:
-                values[key] = str(self.config.get(key, default) if self.config.get(key, default) is not None else "")
+                if key == "piper_voice":
+                    values[key] = str(
+                        self.config.get("piper", {}).get("voice", self.config.get("piper_voice", PIPER_DEFAULT_VOICE))
+                    )
+                else:
+                    values[key] = str(self.config.get(key, default) if self.config.get(key, default) is not None else "")
 
         active = 0
         cursor = len(values.get(fields[active]["key"], "")) if fields[active]["type"] in ("text", "int") else 0
@@ -1421,6 +1543,13 @@ class TUIEmail:
                     display = ("*" * len(raw)) if field.get("secret") and raw else raw
                     win.addstr(y, 27, display[: modal_w - 30].ljust(modal_w - 30), attr)
 
+            voices_hint = ""
+            if piper_voice_options:
+                sample = piper_voice_options[:6]
+                voices_hint = "Piper voices: " + ", ".join(sample)
+                if len(piper_voice_options) > 6:
+                    voices_hint += ", ..."
+            win.addstr(modal_h - 3, 2, voices_hint[: modal_w - 4])
             win.addstr(modal_h - 2, 2, "Tab/Shift+Tab or Up/Down: navigate  F2:save  F5:reset  Esc/q:close")
 
             active_field = fields[active]
@@ -1438,6 +1567,12 @@ class TUIEmail:
             if key in (27, ord("q"), ord("Q"), curses.KEY_F10):
                 self.status = "Settings cancelled"
                 return
+
+            if active_field["type"] in ("text", "int") and active_field["key"] == "piper_voice" and key in (10, 13, curses.KEY_ENTER):
+                selected = self._piper_voice_selection_modal(values["piper_voice"], piper_voice_options)
+                if selected:
+                    values["piper_voice"] = selected
+                continue
 
             if key == curses.KEY_F5:
                 if self._confirm_reset_modal():
@@ -1460,6 +1595,15 @@ class TUIEmail:
                             if fkey == "fetch_limit" and v <= 0:
                                 raise ValueError("fetch_limit must be > 0")
                             self.config[fkey] = v
+                        elif fkey in ("piper_voice", "piper_model_path", "piper_config_path"):
+                            piper_cfg = self.config.get("piper", {}) if isinstance(self.config.get("piper"), dict) else {}
+                            if fkey == "piper_voice":
+                                piper_cfg["voice"] = values[fkey]
+                            elif fkey == "piper_model_path":
+                                piper_cfg["model_path"] = values[fkey]
+                            elif fkey == "piper_config_path":
+                                piper_cfg["config_path"] = values[fkey]
+                            self.config["piper"] = piper_cfg
                         else:
                             self.config[fkey] = values[fkey]
 
@@ -1867,6 +2011,14 @@ class TUIEmail:
                     elif shutil.which("play"):
                         player_cmd = ["play", tmp_path]
 
+                    if player_cmd is None and os.name == "nt":
+                        # Use PowerShell play command on Windows if available.
+                        player_cmd = [
+                            "powershell",
+                            "-Command",
+                            f"Add-Type -AssemblyName presentationCore; $player = New-Object System.Windows.Media.MediaPlayer; $player.Open([Uri]('{Path(tmp_path).as_uri()}')); $player.Play(); Start-Sleep -Seconds 10"
+                        ]
+
                     if player_cmd is None:
                         try:
                             Path(tmp_path).unlink(missing_ok=True)
@@ -1886,6 +2038,22 @@ class TUIEmail:
                         pass
                     # If piper fails at runtime, fall back.
                     pass
+
+        # Windows built-in TTS (PowerShell) before external drivers
+        if os.name == "nt":
+            try:
+                # Play using PowerShell speech synthesizer
+                cmd = [
+                    "powershell",
+                    "-Command",
+                    "Add-Type -AssemblyName System.Speech; $s=new-object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak(\"" + text.replace('"', '\\"') + "\");",
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._current_tts_proc = proc
+                self._current_tts_tmp_path = None
+                return True, "Reading with Windows TTS"
+            except Exception:
+                pass
 
         # Fallback drivers
         if shutil.which("espeak"):
@@ -2308,6 +2476,9 @@ def main(stdscr):
 
 
 def cli():
+    if curses is None:
+        print("Curses is not available. On Windows install windows-curses or run on UNIX-like system.")
+        return
     if len(sys.argv) >= 3 and sys.argv[1] == "--delete-job":
         try:
             _run_delete_job(sys.argv[2])

@@ -137,8 +137,9 @@ If no engine is present, the status line shows a warning.
 
 ## Piper voice setup
 
-The app downloads a default model to `~/.tui_email/piper_voices`
-if missing:
+On Windows/macOS, install the piper CLI or use the fallback PowerShell voice path.
+
+The app downloads a default model to `~/.tui_email/piper_voices` (or `%APPDATA%\tui_email\piper_voices` on Windows) if missing:
 
 - `en_US-lessac-medium.onnx`
 - `en_US-lessac-medium.onnx.json`
@@ -153,11 +154,14 @@ To override existing paths, set config section in `~/.tui_email/config.json`:
 ```json
 {
   "piper": {
+    "voice": "en_US-lessac-medium",
     "model_path": "/path/to/en_US-lessac-medium.onnx",
     "config_path": "/path/to/en_US-lessac-medium.onnx.json"
   }
 }
 ```
+
+Also from the Settings modal, use the `piper_voice` dropdown to pick a voice ID (one of the voices listed in `voices.json`) and optionally specify `piper_model_path` and `piper_config_path`.
 
 ## Dependencies
 
