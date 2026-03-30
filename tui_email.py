@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-try:
-    import curses
-except ImportError:
-    curses = None
+import platform
+
+if platform.system() == "Windows":
+    try:
+        import curses
+    except ImportError:
+        try:
+            import windows_curses as curses
+        except ImportError:
+            curses = None
+else:
+    try:
+        import curses
+    except ImportError:
+        curses = None
 
 import json
 import sqlite3
@@ -1068,6 +1079,7 @@ class TUIEmail:
         self.conversations = []
         self._current_tts_proc = None
         self._current_tts_tmp_path = None
+        self.quit_requested = False
 
         init_db()
         source_folders = load_folders()
@@ -1092,7 +1104,11 @@ class TUIEmail:
         self.conversations = build_conversations(self.messages)
         self.pending_delete_jobs = 0
         self.pending_fetch_jobs = 0
+        self.quit_requested = False
         self._refresh_background_feedback()
+
+    def request_quit(self):
+        self.quit_requested = True
 
     def _refresh_background_feedback(self):
         try:
@@ -1564,7 +1580,10 @@ class TUIEmail:
             win.refresh()
             key = win.getch()
 
-            if key in (27, ord("q"), ord("Q"), curses.KEY_F10):
+            if key in (ord("q"), ord("Q")):
+                self.request_quit()
+                return
+            if key in (27, curses.KEY_F10):
                 self.status = "Settings cancelled"
                 return
 
@@ -1676,7 +1695,10 @@ class TUIEmail:
             key = win.getch()
             if key in (ord("y"), ord("Y"), 10, 13, curses.KEY_ENTER):
                 return True
-            if key in (ord("n"), ord("N"), 27, ord("q"), ord("Q"), curses.KEY_EXIT):
+            if key in (ord("q"), ord("Q")):
+                self.request_quit()
+                return False
+            if key in (ord("n"), ord("N"), 27, curses.KEY_EXIT):
                 return False
 
     def compose_modal(
@@ -1776,7 +1798,10 @@ class TUIEmail:
                 win.refresh()
                 key = win.getch()
 
-                if key in (27, curses.KEY_EXIT, curses.KEY_F10, ord("q"), ord("Q")):
+                if key in (ord("q"), ord("Q")):
+                    self.request_quit()
+                    return
+                if key in (27, curses.KEY_EXIT, curses.KEY_F10):
                     self.status = "Compose cancelled"
                     return
                 if key in (19, curses.KEY_F2):  # Ctrl+S or F2
@@ -2107,6 +2132,375 @@ class TUIEmail:
         return self._speak_text_offline(text)
 
 
+    def view_message_modal(self, msg):
+        h, w = self.stdscr.getmaxyx()
+        modal_h = min(h - 2, 30)
+        modal_w = min(w - 4, 110)
+        if modal_h < 12 or modal_w < 50:
+            self.status = "Terminal too small for message modal"
+            return
+
+        start_y = (h - modal_h) // 2
+        start_x = (w - modal_w) // 2
+        win = curses.newwin(modal_h, modal_w, start_y, start_x)
+        win.keypad(True)
+
+        body_width = modal_w - 4
+        wrapped_body = self._wrap_body_for_width(msg.body or "", body_width)
+        body_top = 6
+        body_h = modal_h - body_top - 2
+        scroll = 0
+
+        wheel_up_mask = (
+            getattr(curses, "BUTTON4_PRESSED", 0)
+            | getattr(curses, "BUTTON4_RELEASED", 0)
+            | getattr(curses, "BUTTON4_CLICKED", 0)
+        )
+        wheel_down_mask = (
+            getattr(curses, "BUTTON5_PRESSED", 0)
+            | getattr(curses, "BUTTON5_RELEASED", 0)
+            | getattr(curses, "BUTTON5_CLICKED", 0)
+        )
+
+        while True:
+            max_scroll = max(0, len(wrapped_body) - body_h)
+            scroll = max(0, min(scroll, max_scroll))
+
+            win.erase()
+            self._draw_ascii_modal_border(win)
+            win.addstr(0, 2, " Email View ", curses.A_BOLD)
+            win.addstr(1, 2, f"Subject: {msg.subject}"[: modal_w - 4])
+            win.addstr(2, 2, f"From: {msg.from_addr}"[: modal_w - 4])
+            win.addstr(3, 2, f"To: {msg.to_addr}"[: modal_w - 4])
+            win.addstr(4, 2, f"Date: {msg.date}"[: modal_w - 4])
+
+            for idx, line in enumerate(wrapped_body[scroll : scroll + body_h]):
+                win.addstr(body_top + idx, 2, line[:body_width].ljust(body_width))
+
+            hint = "r:reply  a:reply-all  f:forward  t:listen  Up/Down/PgUp/PgDn/wheel scroll  Space/Esc/q close"
+            win.addstr(modal_h - 1, 2, hint[: modal_w - 4])
+            win.refresh()
+
+            key = win.getch()
+            if key in (ord("q"), ord("Q")):
+                self.request_quit()
+                return
+            if key in (27, ord(" ")):
+                return
+            if key in (ord("r"), ord("R")):
+                seed = self._build_reply_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+                return
+            if key in (ord("a"), ord("A")):
+                seed = self._build_reply_all_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+                return
+            if key in (ord("f"), ord("F")):
+                seed = self._build_forward_seed(msg)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+                return
+            if key in (ord("t"), ord("T")):
+                ok, msg_text = self._read_message_aloud(msg)
+                self.status = msg_text if ok else f"TTS failed: {msg_text}"
+                continue
+            if key in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                scroll = min(max_scroll, scroll + 1)
+            elif key == curses.KEY_PPAGE:
+                scroll = max(0, scroll - body_h)
+            elif key == curses.KEY_NPAGE:
+                scroll = min(max_scroll, scroll + body_h)
+            elif key == curses.KEY_HOME:
+                scroll = 0
+            elif key == curses.KEY_END:
+                scroll = max_scroll
+            elif key == curses.KEY_MOUSE:
+                try:
+                    _, _, _, _, bstate = curses.getmouse()
+                    if bstate & wheel_up_mask:
+                        scroll = max(0, scroll - 3)
+                    elif bstate & wheel_down_mask:
+                        scroll = min(max_scroll, scroll + 3)
+                except curses.error:
+                    pass
+
+    def _draw(self):
+        self.stdscr.clear()
+        h, w = self.stdscr.getmaxyx()
+        if h < 24 or w < 80:
+            self.stdscr.addstr(0, 0, "Resize terminal to 80x24 or larger")
+            self.stdscr.refresh()
+            return
+
+        yoff = 1
+        username = self.config.get("imap_user", "unknown")
+        year = datetime.now().year
+        header_text = f"{username} | TUI Email | (C) Lucas Burlingham {year}"
+        header_display = header_text[: max(0, w - 1)]
+        header_x = max(0, (w - len(header_display)) // 2)
+        self.stdscr.addstr(0, 0, " " * (w - 1), self.header_attr)
+        self.stdscr.addstr(0, header_x, header_display, self.header_attr)
+
+        shortcut_items = [
+            "q:Quit",
+            "o:Settings",
+            "Space:View",
+            "c:Compose",
+            "R:Reply",
+            "W:Forward",
+            "s:SendDraft",
+            "t:Listen",
+            "f:Fetch",
+            "F:FetchAll",
+            "←/→ Folder",
+            "↑/↓ Conv",
+            "PgUp/PgDn:Body",
+            "[ / ]:Body",
+            "d:ToTrash",
+            "r:ToggleRead",
+        ]
+        shortcut_lines = self._wrap_shortcuts(shortcut_items, w - 1)
+        footer_rows = 1 + len(shortcut_lines)  # status + wrapped shortcut lines
+        footer_top = h - footer_rows
+        content_bottom = footer_top - 1
+
+        folder_w = 20
+        list_w = 40
+        detail_w = w - folder_w - list_w - 4
+
+        self.stdscr.addstr(yoff + 0, 0, "Folders", curses.A_BOLD | curses.A_UNDERLINE)
+        for i, folder in enumerate(self.folders):
+            attr = curses.A_REVERSE if i == self.folder_index else curses.A_NORMAL
+            ts = self.last_fetch.get(folder)
+            ts_str = ts.strftime("%H:%M") if ts else "--:--"
+            label = f"{folder} [{ts_str}]"
+            self.stdscr.addstr(yoff + 1 + i, 0, label[:folder_w-1].ljust(folder_w-1), attr)
+
+        self.stdscr.addstr(yoff + 0, folder_w + 1, "Messages", curses.A_BOLD | curses.A_UNDERLINE)
+        self.messages = load_messages(self.current_folder())
+        self.conversations = build_conversations(self.messages)
+        if self.message_index >= len(self.conversations):
+            self.message_index = max(0, len(self.conversations) - 1)
+        max_message_rows = max(0, content_bottom - (yoff + 1) + 1)
+        for i, convo in enumerate(self.conversations[:max_message_rows]):
+            attrs = curses.A_REVERSE if i == self.message_index else curses.A_NORMAL
+            unread = convo.unread_count
+            prefix = "*" if unread > 0 else " "
+            from_part = convo.display_from[:10]
+            subject_part = convo.subject[:18]
+            count_part = f"({len(convo.messages)})"
+            line = f"{prefix} {from_part:10} {subject_part:18} {count_part}"
+            self.stdscr.addstr(yoff + 1 + i, folder_w + 1, line[:list_w-1], attrs)
+
+        detail_x = folder_w + list_w + 2
+        self.detail_body_rect = None
+        self.detail_scroll_max = 0
+        self.stdscr.addstr(yoff + 0, detail_x, "Detail", curses.A_BOLD | curses.A_UNDERLINE)
+        if self.conversations:
+            selected_convo = self.conversations[self.message_index]
+            selected = selected_convo.latest
+            self.stdscr.addstr(yoff + 1, detail_x, f"Subject: {selected_convo.subject}"[:detail_w])
+            self.stdscr.addstr(yoff + 2, detail_x, f"Messages: {len(selected_convo.messages)}  Unread: {selected_convo.unread_count}"[:detail_w])
+            self.stdscr.addstr(yoff + 3, detail_x, f"From: {selected.from_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 4, detail_x, f"To: {selected.to_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 5, detail_x, f"Cc: {selected.cc_addr}"[:detail_w])
+            self.stdscr.addstr(yoff + 6, detail_x, f"Date: {selected.date}"[:detail_w])
+
+            thread_rows = max(0, min(4, h - 17))
+            self.stdscr.addstr(yoff + 8, detail_x, "Thread:", curses.A_BOLD)
+            for idx, thread_msg in enumerate(selected_convo.messages[:thread_rows]):
+                marker = "*" if not thread_msg.read else " "
+                thread_line = f"{marker} {thread_msg.date[:12]:12} {thread_msg.from_addr[:12]:12}"
+                self.stdscr.addstr(yoff + 9 + idx, detail_x, thread_line[:detail_w])
+
+            body_start = yoff + 10 + thread_rows
+            wrapped_body_lines = self._wrap_body_for_width(selected.body, detail_w)
+            max_body_rows = max(0, content_bottom - body_start + 1)
+            self.detail_scroll_max = max(0, len(wrapped_body_lines) - max_body_rows)
+            self.detail_scroll = max(0, min(self.detail_scroll, self.detail_scroll_max))
+            self.detail_body_rect = (detail_x, body_start, detail_x + detail_w - 1, content_bottom)
+            visible_lines = wrapped_body_lines[self.detail_scroll : self.detail_scroll + max_body_rows]
+            for idx, line in enumerate(visible_lines):
+                self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
+
+        status_text = f"Status: {self.status}"
+        if self.pending_delete_jobs > 0:
+            status_text += f" | bg-delete pending: {self.pending_delete_jobs}"
+        if self.pending_fetch_jobs > 0:
+            status_text += f" | bg-fetch pending: {self.pending_fetch_jobs}"
+        self.stdscr.addstr(footer_top, 0, " " * (w - 1), self.status_attr)
+        self.stdscr.addstr(footer_top, 1, status_text[: max(0, w - 3)], self.status_attr)
+        for i, line in enumerate(shortcut_lines):
+            self.stdscr.addstr(footer_top + 1 + i, 0, " " * (w - 1))
+            self.stdscr.addstr(footer_top + 1 + i, 0, line[: w - 1])
+        self.stdscr.refresh()
+
+    def run(self):
+        curses.curs_set(0)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+            self.status_attr = curses.color_pair(1) | curses.A_BOLD
+            self.header_attr = curses.color_pair(2) | curses.A_BOLD
+        while True:
+            if self.quit_requested:
+                break
+            self._refresh_background_feedback()
+            self._draw()
+            key = self.stdscr.getch()
+            if key in (ord("q"), ord("Q")):
+                self._stop_tts()
+                self.request_quit()
+                break
+            elif key in (curses.KEY_LEFT, ord("h")):
+                self._stop_tts()
+                self.folder_index = max(0, self.folder_index - 1)
+                self.message_index = 0
+                self.detail_scroll = 0
+            elif key in (curses.KEY_RIGHT, ord("l")):
+                self._stop_tts()
+                self.folder_index = min(len(self.folders) - 1, self.folder_index + 1)
+                self.message_index = 0
+                self.detail_scroll = 0
+            elif key in (curses.KEY_UP, ord("k")):
+                self._stop_tts()
+                self.message_index = max(0, self.message_index - 1)
+                self.detail_scroll = 0
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self._stop_tts()
+                self.message_index = min(len(self.conversations) - 1, self.message_index + 1)
+                self.detail_scroll = 0
+            elif key in (curses.KEY_PPAGE, ord("[")) and self.conversations:
+                self.detail_scroll = max(0, self.detail_scroll - 5)
+            elif key in (curses.KEY_NPAGE, ord("]")) and self.conversations:
+                self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 5)
+            elif key == curses.KEY_MOUSE and self.conversations and self.detail_body_rect:
+                try:
+                    _, mx, my, _, bstate = curses.getmouse()
+                except curses.error:
+                    continue
+
+                x1, y1, x2, y2 = self.detail_body_rect
+                if not (x1 <= mx <= x2 and y1 <= my <= y2):
+                    continue
+
+                wheel_up_mask = (
+                    getattr(curses, "BUTTON4_PRESSED", 0)
+                    | getattr(curses, "BUTTON4_RELEASED", 0)
+                    | getattr(curses, "BUTTON4_CLICKED", 0)
+                )
+                wheel_down_mask = (
+                    getattr(curses, "BUTTON5_PRESSED", 0)
+                    | getattr(curses, "BUTTON5_RELEASED", 0)
+                    | getattr(curses, "BUTTON5_CLICKED", 0)
+                )
+
+                if bstate & wheel_up_mask:
+                    self.detail_scroll = max(0, self.detail_scroll - 3)
+                elif bstate & wheel_down_mask:
+                    self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 3)
+            elif key == ord(" ") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                self.view_message_modal(selected)
+            elif key == ord("o"):
+                self.settings_modal()
+            elif key == ord("f"):
+                self.fetch_current_folder()
+            elif key == ord("F"):
+                self.fetch_all_folders()
+            elif key in (ord("t"), ord("T")) and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                ok, msg_text = self._read_message_aloud(selected)
+                self.status = msg_text if ok else f"TTS failed: {msg_text}"
+            elif key == ord("d") and self.conversations:
+                self.delete_selected_conversation_verified()
+            elif key == ord("r") and self.conversations:
+                selected_convo = self.conversations[self.message_index]
+                mark_read = any(not m.read for m in selected_convo.messages)
+                for msg in selected_convo.messages:
+                    msg.read = mark_read
+                    save_message(msg)
+                self.status = "Conversation marked read" if mark_read else "Conversation marked unread"
+            elif key == ord("s"):
+                if self.current_folder().lower() != "drafts":
+                    self.status = "Open Drafts to send"
+                    continue
+                if not self.conversations:
+                    self.status = "No draft selected"
+                    continue
+
+                draft = self.conversations[self.message_index].latest
+                if not self.confirm_send_modal(draft):
+                    self.status = "Send cancelled"
+                    continue
+                ok, message = send_draft_message(self.config, draft)
+                if not ok:
+                    self.status = message
+                    continue
+
+                draft.folder = "Sent"
+                draft.read = True
+                draft.date = datetime.now().isoformat(timespec="seconds")
+                save_message(draft)
+
+                self.messages = load_messages(self.current_folder())
+                self.conversations = build_conversations(self.messages)
+                self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
+                self.status = f"Draft sent to {draft.to_addr or '(unknown)'}"
+            elif key == ord("R") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                seed = self._build_reply_seed(selected)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+            elif key == ord("W") and self.conversations:
+                selected = self.conversations[self.message_index].latest
+                seed = self._build_forward_seed(selected)
+                self.compose_modal(
+                    title=seed["title"],
+                    initial_to=seed["to"],
+                    initial_cc=seed["cc"],
+                    initial_bcc=seed["bcc"],
+                    initial_subject=seed["subject"],
+                    initial_body=seed["body"],
+                )
+            elif key == ord("c"):
+                self.compose_modal()
+
+
 def headless_speak_text_offline(text, config):
     if not text:
         return False, "No text to speak"
@@ -2314,369 +2708,6 @@ def headless_mode():
         print("Unknown command. Type help.")
 
     return
-
-    def view_message_modal(self, msg):
-        h, w = self.stdscr.getmaxyx()
-        modal_h = min(h - 2, 30)
-        modal_w = min(w - 4, 110)
-        if modal_h < 12 or modal_w < 50:
-            self.status = "Terminal too small for message modal"
-            return
-
-        start_y = (h - modal_h) // 2
-        start_x = (w - modal_w) // 2
-        win = curses.newwin(modal_h, modal_w, start_y, start_x)
-        win.keypad(True)
-
-        body_width = modal_w - 4
-        wrapped_body = self._wrap_body_for_width(msg.body or "", body_width)
-        body_top = 6
-        body_h = modal_h - body_top - 2
-        scroll = 0
-
-        wheel_up_mask = (
-            getattr(curses, "BUTTON4_PRESSED", 0)
-            | getattr(curses, "BUTTON4_RELEASED", 0)
-            | getattr(curses, "BUTTON4_CLICKED", 0)
-        )
-        wheel_down_mask = (
-            getattr(curses, "BUTTON5_PRESSED", 0)
-            | getattr(curses, "BUTTON5_RELEASED", 0)
-            | getattr(curses, "BUTTON5_CLICKED", 0)
-        )
-
-        while True:
-            max_scroll = max(0, len(wrapped_body) - body_h)
-            scroll = max(0, min(scroll, max_scroll))
-
-            win.erase()
-            self._draw_ascii_modal_border(win)
-            win.addstr(0, 2, " Email View ", curses.A_BOLD)
-            win.addstr(1, 2, f"Subject: {msg.subject}"[: modal_w - 4])
-            win.addstr(2, 2, f"From: {msg.from_addr}"[: modal_w - 4])
-            win.addstr(3, 2, f"To: {msg.to_addr}"[: modal_w - 4])
-            win.addstr(4, 2, f"Date: {msg.date}"[: modal_w - 4])
-
-            for idx, line in enumerate(wrapped_body[scroll : scroll + body_h]):
-                win.addstr(body_top + idx, 2, line[:body_width].ljust(body_width))
-
-            hint = "r:reply  a:reply-all  f:forward  t:listen  Up/Down/PgUp/PgDn/wheel scroll  Space/Esc/q close"
-            win.addstr(modal_h - 1, 2, hint[: modal_w - 4])
-            win.refresh()
-
-            key = win.getch()
-            if key in (ord("q"), ord("Q"), 27, ord(" ")):
-                return
-            if key in (ord("r"), ord("R")):
-                seed = self._build_reply_seed(msg)
-                self.compose_modal(
-                    title=seed["title"],
-                    initial_to=seed["to"],
-                    initial_cc=seed["cc"],
-                    initial_bcc=seed["bcc"],
-                    initial_subject=seed["subject"],
-                    initial_body=seed["body"],
-                )
-                return
-            if key in (ord("a"), ord("A")):
-                seed = self._build_reply_all_seed(msg)
-                self.compose_modal(
-                    title=seed["title"],
-                    initial_to=seed["to"],
-                    initial_cc=seed["cc"],
-                    initial_bcc=seed["bcc"],
-                    initial_subject=seed["subject"],
-                    initial_body=seed["body"],
-                )
-                return
-            if key in (ord("f"), ord("F")):
-                seed = self._build_forward_seed(msg)
-                self.compose_modal(
-                    title=seed["title"],
-                    initial_to=seed["to"],
-                    initial_cc=seed["cc"],
-                    initial_bcc=seed["bcc"],
-                    initial_subject=seed["subject"],
-                    initial_body=seed["body"],
-                )
-                return
-            if key in (ord("t"), ord("T")):
-                ok, msg_text = self._read_message_aloud(msg)
-                self.status = msg_text if ok else f"TTS failed: {msg_text}"
-                continue
-            if key in (curses.KEY_UP, ord("k")):
-                scroll = max(0, scroll - 1)
-            elif key in (curses.KEY_DOWN, ord("j")):
-                scroll = min(max_scroll, scroll + 1)
-            elif key == curses.KEY_PPAGE:
-                scroll = max(0, scroll - body_h)
-            elif key == curses.KEY_NPAGE:
-                scroll = min(max_scroll, scroll + body_h)
-            elif key == curses.KEY_HOME:
-                scroll = 0
-            elif key == curses.KEY_END:
-                scroll = max_scroll
-            elif key == curses.KEY_MOUSE:
-                try:
-                    _, _, _, _, bstate = curses.getmouse()
-                    if bstate & wheel_up_mask:
-                        scroll = max(0, scroll - 3)
-                    elif bstate & wheel_down_mask:
-                        scroll = min(max_scroll, scroll + 3)
-                except curses.error:
-                    pass
-
-    def _draw(self):
-        self.stdscr.clear()
-        h, w = self.stdscr.getmaxyx()
-        if h < 24 or w < 80:
-            self.stdscr.addstr(0, 0, "Resize terminal to 80x24 or larger")
-            self.stdscr.refresh()
-            return
-
-        yoff = 1
-        username = self.config.get("imap_user", "unknown")
-        year = datetime.now().year
-        header_text = f"{username} | TUI Email | (C) Lucas Burlingham {year}"
-        header_display = header_text[: max(0, w - 1)]
-        header_x = max(0, (w - len(header_display)) // 2)
-        self.stdscr.addstr(0, 0, " " * (w - 1), self.header_attr)
-        self.stdscr.addstr(0, header_x, header_display, self.header_attr)
-
-        shortcut_items = [
-            "q:Quit",
-            "o:Settings",
-            "Space:View",
-            "c:Compose",
-            "R:Reply",
-            "W:Forward",
-            "s:SendDraft",
-            "t:Listen",
-            "f:Fetch",
-            "F:FetchAll",
-            "←/→ Folder",
-            "↑/↓ Conv",
-            "PgUp/PgDn:Body",
-            "[ / ]:Body",
-            "d:ToTrash",
-            "r:ToggleRead",
-        ]
-        shortcut_lines = self._wrap_shortcuts(shortcut_items, w - 1)
-        footer_rows = 1 + len(shortcut_lines)  # status + wrapped shortcut lines
-        footer_top = h - footer_rows
-        content_bottom = footer_top - 1
-
-        folder_w = 20
-        list_w = 40
-        detail_w = w - folder_w - list_w - 4
-
-        self.stdscr.addstr(yoff + 0, 0, "Folders", curses.A_BOLD | curses.A_UNDERLINE)
-        for i, folder in enumerate(self.folders):
-            attr = curses.A_REVERSE if i == self.folder_index else curses.A_NORMAL
-            ts = self.last_fetch.get(folder)
-            ts_str = ts.strftime("%H:%M") if ts else "--:--"
-            label = f"{folder} [{ts_str}]"
-            self.stdscr.addstr(yoff + 1 + i, 0, label[:folder_w-1].ljust(folder_w-1), attr)
-
-        self.stdscr.addstr(yoff + 0, folder_w + 1, "Messages", curses.A_BOLD | curses.A_UNDERLINE)
-        self.messages = load_messages(self.current_folder())
-        self.conversations = build_conversations(self.messages)
-        if self.message_index >= len(self.conversations):
-            self.message_index = max(0, len(self.conversations) - 1)
-        max_message_rows = max(0, content_bottom - (yoff + 1) + 1)
-        for i, convo in enumerate(self.conversations[:max_message_rows]):
-            attrs = curses.A_REVERSE if i == self.message_index else curses.A_NORMAL
-            unread = convo.unread_count
-            prefix = "*" if unread > 0 else " "
-            from_part = convo.display_from[:10]
-            subject_part = convo.subject[:18]
-            count_part = f"({len(convo.messages)})"
-            line = f"{prefix} {from_part:10} {subject_part:18} {count_part}"
-            self.stdscr.addstr(yoff + 1 + i, folder_w + 1, line[:list_w-1], attrs)
-
-        detail_x = folder_w + list_w + 2
-        self.detail_body_rect = None
-        self.detail_scroll_max = 0
-        self.stdscr.addstr(yoff + 0, detail_x, "Detail", curses.A_BOLD | curses.A_UNDERLINE)
-        if self.conversations:
-            selected_convo = self.conversations[self.message_index]
-            selected = selected_convo.latest
-            self.stdscr.addstr(yoff + 1, detail_x, f"Subject: {selected_convo.subject}"[:detail_w])
-            self.stdscr.addstr(yoff + 2, detail_x, f"Messages: {len(selected_convo.messages)}  Unread: {selected_convo.unread_count}"[:detail_w])
-            self.stdscr.addstr(yoff + 3, detail_x, f"From: {selected.from_addr}"[:detail_w])
-            self.stdscr.addstr(yoff + 4, detail_x, f"To: {selected.to_addr}"[:detail_w])
-            self.stdscr.addstr(yoff + 5, detail_x, f"Cc: {selected.cc_addr}"[:detail_w])
-            self.stdscr.addstr(yoff + 6, detail_x, f"Date: {selected.date}"[:detail_w])
-
-            thread_rows = max(0, min(4, h - 17))
-            self.stdscr.addstr(yoff + 8, detail_x, "Thread:", curses.A_BOLD)
-            for idx, thread_msg in enumerate(selected_convo.messages[:thread_rows]):
-                marker = "*" if not thread_msg.read else " "
-                thread_line = f"{marker} {thread_msg.date[:12]:12} {thread_msg.from_addr[:12]:12}"
-                self.stdscr.addstr(yoff + 9 + idx, detail_x, thread_line[:detail_w])
-
-            body_start = yoff + 10 + thread_rows
-            wrapped_body_lines = self._wrap_body_for_width(selected.body, detail_w)
-            max_body_rows = max(0, content_bottom - body_start + 1)
-            self.detail_scroll_max = max(0, len(wrapped_body_lines) - max_body_rows)
-            self.detail_scroll = max(0, min(self.detail_scroll, self.detail_scroll_max))
-            self.detail_body_rect = (detail_x, body_start, detail_x + detail_w - 1, content_bottom)
-            visible_lines = wrapped_body_lines[self.detail_scroll : self.detail_scroll + max_body_rows]
-            for idx, line in enumerate(visible_lines):
-                self.stdscr.addstr(body_start + idx, detail_x, line[:detail_w])
-
-        status_text = f"Status: {self.status}"
-        if self.pending_delete_jobs > 0:
-            status_text += f" | bg-delete pending: {self.pending_delete_jobs}"
-        if self.pending_fetch_jobs > 0:
-            status_text += f" | bg-fetch pending: {self.pending_fetch_jobs}"
-        self.stdscr.addstr(footer_top, 0, " " * (w - 1), self.status_attr)
-        self.stdscr.addstr(footer_top, 1, status_text[: max(0, w - 3)], self.status_attr)
-        for i, line in enumerate(shortcut_lines):
-            self.stdscr.addstr(footer_top + 1 + i, 0, " " * (w - 1))
-            self.stdscr.addstr(footer_top + 1 + i, 0, line[: w - 1])
-        self.stdscr.refresh()
-
-    def run(self):
-        curses.curs_set(0)
-        try:
-            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
-        except curses.error:
-            pass
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-            self.status_attr = curses.color_pair(1) | curses.A_BOLD
-            self.header_attr = curses.color_pair(2) | curses.A_BOLD
-        while True:
-            self._refresh_background_feedback()
-            self._draw()
-            key = self.stdscr.getch()
-            if key == ord("q"):
-                self._stop_tts()
-                break
-            elif key in (curses.KEY_LEFT, ord("h")):
-                self._stop_tts()
-                self.folder_index = max(0, self.folder_index - 1)
-                self.message_index = 0
-                self.detail_scroll = 0
-            elif key in (curses.KEY_RIGHT, ord("l")):
-                self._stop_tts()
-                self.folder_index = min(len(self.folders) - 1, self.folder_index + 1)
-                self.message_index = 0
-                self.detail_scroll = 0
-            elif key in (curses.KEY_UP, ord("k")):
-                self._stop_tts()
-                self.message_index = max(0, self.message_index - 1)
-                self.detail_scroll = 0
-            elif key in (curses.KEY_DOWN, ord("j")):
-                self._stop_tts()
-                self.message_index = min(len(self.conversations) - 1, self.message_index + 1)
-                self.detail_scroll = 0
-            elif key in (curses.KEY_PPAGE, ord("[")) and self.conversations:
-                self.detail_scroll = max(0, self.detail_scroll - 5)
-            elif key in (curses.KEY_NPAGE, ord("]")) and self.conversations:
-                self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 5)
-            elif key == curses.KEY_MOUSE and self.conversations and self.detail_body_rect:
-                try:
-                    _, mx, my, _, bstate = curses.getmouse()
-                except curses.error:
-                    continue
-
-                x1, y1, x2, y2 = self.detail_body_rect
-                if not (x1 <= mx <= x2 and y1 <= my <= y2):
-                    continue
-
-                wheel_up_mask = (
-                    getattr(curses, "BUTTON4_PRESSED", 0)
-                    | getattr(curses, "BUTTON4_RELEASED", 0)
-                    | getattr(curses, "BUTTON4_CLICKED", 0)
-                )
-                wheel_down_mask = (
-                    getattr(curses, "BUTTON5_PRESSED", 0)
-                    | getattr(curses, "BUTTON5_RELEASED", 0)
-                    | getattr(curses, "BUTTON5_CLICKED", 0)
-                )
-
-                if bstate & wheel_up_mask:
-                    self.detail_scroll = max(0, self.detail_scroll - 3)
-                elif bstate & wheel_down_mask:
-                    self.detail_scroll = min(self.detail_scroll_max, self.detail_scroll + 3)
-            elif key == ord(" ") and self.conversations:
-                selected = self.conversations[self.message_index].latest
-                self.view_message_modal(selected)
-            elif key == ord("o"):
-                self.settings_modal()
-            elif key == ord("f"):
-                self.fetch_current_folder()
-            elif key == ord("F"):
-                self.fetch_all_folders()
-            elif key in (ord("t"), ord("T")) and self.conversations:
-                selected = self.conversations[self.message_index].latest
-                ok, msg_text = self._read_message_aloud(selected)
-                self.status = msg_text if ok else f"TTS failed: {msg_text}"
-            elif key == ord("d") and self.conversations:
-                self.delete_selected_conversation_verified()
-            elif key == ord("r") and self.conversations:
-                selected_convo = self.conversations[self.message_index]
-                mark_read = any(not m.read for m in selected_convo.messages)
-                for msg in selected_convo.messages:
-                    msg.read = mark_read
-                    save_message(msg)
-                self.status = "Conversation marked read" if mark_read else "Conversation marked unread"
-            elif key == ord("s"):
-                if self.current_folder().lower() != "drafts":
-                    self.status = "Open Drafts to send"
-                    continue
-                if not self.conversations:
-                    self.status = "No draft selected"
-                    continue
-
-                draft = self.conversations[self.message_index].latest
-                if not self.confirm_send_modal(draft):
-                    self.status = "Send cancelled"
-                    continue
-                ok, message = send_draft_message(self.config, draft)
-                if not ok:
-                    self.status = message
-                    continue
-
-                draft.folder = "Sent"
-                draft.read = True
-                draft.date = datetime.now().isoformat(timespec="seconds")
-                save_message(draft)
-
-                self.messages = load_messages(self.current_folder())
-                self.conversations = build_conversations(self.messages)
-                self.message_index = min(self.message_index, max(0, len(self.conversations) - 1))
-                self.status = f"Draft sent to {draft.to_addr or '(unknown)'}"
-            elif key == ord("R") and self.conversations:
-                selected = self.conversations[self.message_index].latest
-                seed = self._build_reply_seed(selected)
-                self.compose_modal(
-                    title=seed["title"],
-                    initial_to=seed["to"],
-                    initial_cc=seed["cc"],
-                    initial_bcc=seed["bcc"],
-                    initial_subject=seed["subject"],
-                    initial_body=seed["body"],
-                )
-            elif key == ord("W") and self.conversations:
-                selected = self.conversations[self.message_index].latest
-                seed = self._build_forward_seed(selected)
-                self.compose_modal(
-                    title=seed["title"],
-                    initial_to=seed["to"],
-                    initial_cc=seed["cc"],
-                    initial_bcc=seed["bcc"],
-                    initial_subject=seed["subject"],
-                    initial_body=seed["body"],
-                )
-            elif key == ord("c"):
-                self.compose_modal()
-
 
 def main(stdscr):
     init_db()

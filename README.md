@@ -58,7 +58,9 @@ python3 tui_email.py
 
 ## Build a distributable binary
 
-This project can be distributed as a standalone Linux console binary with PyInstaller.
+This project can be distributed as a standalone console binary for Linux and Windows with PyInstaller.
+
+### Linux build
 
 Install build dependency:
 
@@ -83,6 +85,7 @@ Or use Make targets:
 
 ```bash
 make release
+make linux-release
 make install
 ```
 
@@ -94,6 +97,38 @@ The generated binary is written to:
 ```bash
 dist/tuiemail
 ```
+
+### Windows build
+
+From PowerShell/cmd:
+
+```powershell
+cd C:\Users\LucasBurlingham\tuiemail
+py -m pip install -r requirements-build.txt
+py -m pip install windows-curses
+py -m PyInstaller --clean tuiemail.spec
+```
+
+Or use Make targets (Git Bash / WSL make is required):
+
+```bash
+make release
+make win-release
+```
+
+`windows-curses` is required for Windows. `make win-release` installs it automatically in the venv first.
+
+The generated binary is written to:
+
+```powershell
+dist\tuiemail.exe
+```
+
+Notes:
+
+- Windows builds may require adding `C:\Users\<you>\AppData\Local\Python\pythoncore-<version>-64\Scripts` to PATH so PyInstaller is found.
+- `pyinstaller` may warn about script location; ensure `py` does not conflict with existing Python installs.
+- Linux or Windows builds still use `~/.tui_email/config.json` (or `%APPDATA%\tui_email\config.json`) and local message DB at runtime.
 
 Notes:
 
@@ -146,8 +181,8 @@ The app downloads a default model to `~/.tui_email/piper_voices` (or `%APPDATA%\
 
 from:
 
-- https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx
-- https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
+- [https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx](https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx)
+- [https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json](https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json)
 
 To override existing paths, set config section in `~/.tui_email/config.json`:
 
@@ -167,8 +202,7 @@ Also from the Settings modal, use the `piper_voice` dropdown to pick a voice ID 
 
 - Python 3.8+
 - `curses` (std lib; on Linux built-in)
-- `piper` (recommended for best quality, optionally install from https://github.com/rhasspy/piper)
-
+- `piper` (recommended for best quality, optionally install from [github.com/rhasspy/piper](https://github.com/rhasspy/piper))
 
 ## Troubleshooting
 
