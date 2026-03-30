@@ -2106,6 +2106,215 @@ class TUIEmail:
         text = ". ".join(snippet)
         return self._speak_text_offline(text)
 
+
+def headless_speak_text_offline(text, config):
+    if not text:
+        return False, "No text to speak"
+    text = (text or "").strip()
+    if not text:
+        return False, "No text after trimming"
+
+    # try piper first
+    if shutil.which("piper"):
+        voices = _load_piper_voices()
+        voice = config.get("piper", {}).get("voice", PIPER_DEFAULT_VOICE)
+        model_path, config_path = _ensure_piper_voice(None, None)
+        if model_path and config_path:
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp_path = tmp.name
+                with open("/tmp/piper-tts-input.txt", "w", encoding="utf-8") as f:
+                    f.write(text)
+                subprocess.run([
+                    "piper",
+                    "-m",
+                    model_path,
+                    "-c",
+                    config_path,
+                    "-i",
+                    "/tmp/piper-tts-input.txt",
+                    "-f",
+                    tmp_path,
+                ], check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.name == "nt":
+                    player_cmd = ["powershell", "-Command", f"Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak(\"{text}\");"]
+                elif shutil.which("aplay"):
+                    player_cmd = ["aplay", tmp_path]
+                elif shutil.which("ffplay"):
+                    player_cmd = ["ffplay", "-nodisp", "-autoexit", tmp_path]
+                elif shutil.which("play"):
+                    player_cmd = ["play", tmp_path]
+                else:
+                    player_cmd = None
+
+                if player_cmd:
+                    subprocess.Popen(player_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    return True, "Reading with Piper TTS"
+            except Exception as exc:
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
+                return False, f"Piper tts failed: {exc}"
+
+    # fallback to platform voice
+    if os.name == "nt":
+        try:
+            cmd = [
+                "powershell",
+                "-Command",
+                f"Add-Type -AssemblyName System.Speech; $s=new-object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak(\"{text.replace('"','\\"')}\");",
+            ]
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True, "Reading with Windows TTS"
+        except Exception as exc:
+            return False, f"Windows TTS failed: {exc}"
+
+    if shutil.which("espeak"):
+        try:
+            subprocess.Popen(["espeak", "-v", "en", text], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True, "Reading with espeak"
+        except Exception as exc:
+            return False, f"espeak failed: {exc}"
+
+    return False, "No TTS available"
+
+
+def headless_mode():
+    init_db()
+    cfg = load_config()
+
+    folders = load_folders() or FOLDERS_DEFAULT
+    # Prefer Inbox by default for headless mode
+    if "Inbox" in folders:
+        folder_idx = folders.index("Inbox")
+    else:
+        folder_idx = 0
+
+    def speak(text):
+        if not text:
+            return
+        try:
+            headless_speak_text_offline(text, cfg)
+        except Exception:
+            pass
+
+    speak("TUI Email Headless Mode started")
+    speak("Type help for commands")
+
+    while True:
+        current_folder = folders[folder_idx] if folders else "Inbox"
+        messages = load_messages(current_folder)
+        conversations = build_conversations(messages)
+        status = f"Folder: {current_folder}, {len(conversations)} threads"
+        print(f"\n{status}")
+        speak(status)
+        print("cmd> ", end="", flush=True)
+        cmd = sys.stdin.readline().strip()
+        if not cmd:
+            continue
+        parts = cmd.split()
+        action = parts[0].lower()
+        if action in ("q", "quit", "exit"):
+            speak("Exiting headless")
+            print("Exiting headless.")
+            break
+        if action == "help":
+            help_text = "commands: help, folders, set <idx>, list, view <idx>, tts <idx>, readall, fetch, refresh"
+            print(help_text)
+            speak(help_text)
+            continue
+        if action == "folders":
+            lines = []
+            for i, f in enumerate(folders):
+                marker = "*" if i == folder_idx else " "
+                line = f"{marker} [{i}] {f}"
+                lines.append(line)
+                print(line)
+            speak("Available folders: " + ", ".join(folders[:8]))
+            continue
+        if action == "set" and len(parts) > 1:
+            try:
+                idx = int(parts[1])
+                if 0 <= idx < len(folders):
+                    folder_idx = idx
+            except Exception:
+                pass
+            continue
+        if action in ("list", "ls"):
+            count = len(conversations)
+            speak(f"There are {count} conversations")
+            for i, convo in enumerate(conversations[:8]):
+                label = f"{i}: {convo.subject} ({len(convo.messages)} messages)"
+                print(label)
+                speak(label)
+            if count > 8:
+                note = f"And {count-8} more..."
+                print(note)
+                speak(note)
+            continue
+        if action == "view" and len(parts) > 1:
+            try:
+                idx = int(parts[1])
+                if 0 <= idx < len(conversations):
+                    msg = conversations[idx].latest
+                    header = f"Viewing message: {msg.subject} from {msg.from_addr}"
+                    body = msg.body
+                    print(f"--- {header} ---")
+                    print(body)
+                    speak(header)
+                    speak(body[:400] + ("..." if len(body) > 400 else ""))
+            except Exception:
+                pass
+            continue
+        if action == "tts" and len(parts) > 1:
+            try:
+                idx = int(parts[1])
+                if 0 <= idx < len(conversations):
+                    msg = conversations[idx].latest
+                    text = f"Subject: {msg.subject}. From: {msg.from_addr}. {msg.body}"
+                    ok, s = headless_speak_text_offline(text, cfg)
+                    response = s if ok else f"TTS failed: {s}"
+                    print(response)
+                    speak(response)
+            except Exception as exc:
+                err = f"TTS error: {exc}"
+                print(err)
+                speak(err)
+            continue
+        if action == "readall":
+            for i, convo in enumerate(conversations):
+                prompt = f"Message {i}: {convo.subject}. Read this message? (y/n)"
+                print(prompt)
+                speak(prompt)
+
+                while True:
+                    answer = sys.stdin.readline().strip().lower()
+                    if not answer:
+                        continue
+                    if answer in ("y", "yes"):
+                        msg = convo.latest
+                        text = f"Reading message {i}: {msg.subject} from {msg.from_addr}. {msg.body}"
+                        print(text[:1000])
+                        speak(text)
+                        break
+                    elif answer in ("n", "no"):
+                        skip_text = "Skipped."
+                        print(skip_text)
+                        speak(skip_text)
+                        break
+                    else:
+                        invalid = "Please answer y or n."
+                        print(invalid)
+                        speak(invalid)
+            continue
+        if action in ("fetch", "refresh"):
+            ok, detail = start_background_fetch_job(mode="current", folder=current_folder, fetch_limit=FETCH_LIMIT)
+            print(f"Fetch queued: {ok} {detail}")
+            continue
+        print("Unknown command. Type help.")
+
+    return
+
     def view_message_modal(self, msg):
         h, w = self.stdscr.getmaxyx()
         modal_h = min(h - 2, 30)
@@ -2476,9 +2685,14 @@ def main(stdscr):
 
 
 def cli():
+    args = sys.argv[1:]
+    if "--headless" in args:
+        return headless_mode()
+
     if curses is None:
-        print("Curses is not available. On Windows install windows-curses or run on UNIX-like system.")
+        print("Curses is not available. On Windows install windows-curses or run on UNIX-like system, or use --headless.")
         return
+
     if len(sys.argv) >= 3 and sys.argv[1] == "--delete-job":
         try:
             _run_delete_job(sys.argv[2])
