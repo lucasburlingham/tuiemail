@@ -1,6 +1,10 @@
 # TUI Email Client
 
-A lightweight terminal-based email client with Outlook-like workflow and secure local storage.
+A lightweight terminal-based email client with Outlook-like workflow and secure local storage. Interact with intuitive keyboard shortcuts. Use `--headless` to work through your inbox with Text To Speech for visually impaired users (voice operated mode planned).
+
+If you need more features, you probably should just open a browser and go to your provider's webmail.
+
+TL;DR: Simple-by-design email client for the terminal. Configure, then type `f` to Fetch the currently highlighted folder. `Spacebar` to view in a modal, `c` to Compose new message, `R` to Reply, `r` to mark as Read, `W` to forWard, navigate with arrow keys. 
 
 ## Features
 
