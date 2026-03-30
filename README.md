@@ -4,11 +4,11 @@ A lightweight terminal-based email client with Outlook-like workflow and secure 
 
 If you need more features, you probably should just open a browser and go to your provider's webmail.
 
-TL;DR: Simple-by-design email client for the terminal. Configure, then type `f` to Fetch the currently highlighted folder. `Spacebar` to view in a modal, `c` to Compose new message, `R` to Reply, `r` to mark as Read, `W` to forWard, navigate with arrow keys. 
+TL;DR: Simple-by-design email client for the terminal. Configure, then type `f` to Fetch the currently highlighted folder. `Spacebar` to view in a modal, `c` to Compose new message, `R` to Reply, `r` to mark as Read, `W` to forWard, `t` to listen (offline TTS), navigate with arrow keys.
 
 ## Features
 
-- Folder view: `Inbox`, `Sent`, `Drafts`, `Archive`, `Flagged`, `Trash`
+- Folder view: `Inbox`, `Sent`, `Drafts`, `Archive`, `Flagged`, `Spam`, `Trash`
 - Conversation view inside each folder (threads grouped by subject)
 - Scrollable detail pane with wrapped message bodies
 - Scrollable full-message modal viewer
@@ -33,8 +33,8 @@ TL;DR: Simple-by-design email client for the terminal. Configure, then type `f` 
   - `q`: Quit
   - arrow keys / `hjkl` for navigation
   - `[` / `]` and `PgUp` / `PgDn` scroll the side detail pane
-- SQLite persistence for messages in `~/.tui_email/messages.db`
-- Config stored in `~/.tui_email/config.json`
+- SQLite persistence for messages in `~/.tui_email/messages.db` (or `%APPDATA%\tui_email\messages.db` on Windows)
+- Config stored in `~/.tui_email/config.json` (or `%APPDATA%\tui_email\config.json` on Windows)
 
 ## Initial setup
 
